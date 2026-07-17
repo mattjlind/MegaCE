@@ -91,7 +91,7 @@
 			/>
 			<Tool
 				Name="VCPostBuildEventTool"
-				CommandLine="xcopy /Y /I &quot;..\resources\*.ico&quot; &quot;$(OutDir)\resources\&quot;&#x0D;&#x0A;"
+				CommandLine="xcopy /Y /I &quot;$(ProjectDir)..\resources\*.ico&quot; &quot;$(ProjectDir)$(OutDir)\resources\&quot;&#x0D;&#x0A;"
 			/>
 			<DeploymentTool
 				ForceDirty="-1"
@@ -180,7 +180,7 @@
 			/>
 			<Tool
 				Name="VCPostBuildEventTool"
-				CommandLine="xcopy /Y /I &quot;..\resources\*.ico&quot; &quot;$(OutDir)\resources\&quot;&#x0D;&#x0A;"
+				CommandLine="xcopy /Y /I &quot;$(ProjectDir)..\resources\*.ico&quot; &quot;$(ProjectDir)$(OutDir)\resources\&quot;&#x0D;&#x0A;"
 			/>
 			<DeploymentTool
 				ForceDirty="-1"

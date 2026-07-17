@@ -2,6 +2,7 @@
 *.ncb
 *.suo
 *.user
+*.sln.cache
 *.aps
 *.plg
 *.opt
