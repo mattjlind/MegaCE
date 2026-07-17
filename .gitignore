@@ -1,0 +1,32 @@
+# Visual Studio 2008 user/generated files
+*.ncb
+*.suo
+*.user
+*.aps
+*.plg
+*.opt
+
+# Build outputs
+Debug/
+Release/
+ARMV4I/
+*/Debug/
+*/Release/
+*/ARMV4I/
+*/Windows Mobile 6 Professional SDK (ARMV4I)/
+
+# Local runtime files
+log.txt
+session.dat
+settings.dat
+syncstate.dat
+fetch_nodes.tmp
+*.megaenc
+*.megaupload
+
+# Local/reference checkouts
+_tmp_meganz_sdk/
+
+# Codex/agent scratch state
+.agents/
+.codex/
