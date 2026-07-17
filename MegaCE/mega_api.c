@@ -605,7 +605,7 @@ mega_api_decrypt_session_id(void)
         }
     }
 
-    dll = LoadLibrary(TEXT("wm_https.dll"));
+    dll = mega_http_load_bear_tls_dll();
     if (dll == 0) {
         mega_crypto_zero(privk_bin, sizeof(privk_bin));
         mega_crypto_zero(csid_bin, sizeof(csid_bin));

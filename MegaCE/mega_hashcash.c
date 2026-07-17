@@ -424,7 +424,7 @@ hc_try_dll_solver(
         *attempted = 0;
     }
 
-    dll = LoadLibrary(TEXT("wm_https.dll"));
+    dll = mega_http_load_bear_tls_dll();
     if (dll == 0) {
         return 0;
     }

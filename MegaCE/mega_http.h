@@ -26,6 +26,8 @@ void mega_http_set_progress_callback(
 
 void mega_http_progress_message(const char *message);
 
+HMODULE mega_http_load_bear_tls_dll(void);
+
 int mega_http_post(
     const char *host,
     unsigned short port,

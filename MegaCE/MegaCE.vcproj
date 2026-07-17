@@ -91,7 +91,7 @@
 			/>
 			<Tool
 				Name="VCPostBuildEventTool"
-				CommandLine="copy /Y &quot;..\..\tls\tls\$(PlatformName)\$(ConfigurationName)\wm_https.dll&quot; &quot;$(OutDir)\wm_https.dll&quot;&#x0D;&#x0A;xcopy /Y /I &quot;..\resources\*.ico&quot; &quot;$(OutDir)\resources\&quot;&#x0D;&#x0A;"
+				CommandLine="xcopy /Y /I &quot;..\resources\*.ico&quot; &quot;$(OutDir)\resources\&quot;&#x0D;&#x0A;"
 			/>
 			<DeploymentTool
 				ForceDirty="-1"
@@ -180,7 +180,7 @@
 			/>
 			<Tool
 				Name="VCPostBuildEventTool"
-				CommandLine="copy /Y &quot;..\..\tls\tls\$(PlatformName)\$(ConfigurationName)\wm_https.dll&quot; &quot;$(OutDir)\wm_https.dll&quot;&#x0D;&#x0A;xcopy /Y /I &quot;..\resources\*.ico&quot; &quot;$(OutDir)\resources\&quot;&#x0D;&#x0A;"
+				CommandLine="xcopy /Y /I &quot;..\resources\*.ico&quot; &quot;$(OutDir)\resources\&quot;&#x0D;&#x0A;"
 			/>
 			<DeploymentTool
 				ForceDirty="-1"

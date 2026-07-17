@@ -57,6 +57,61 @@ static void mega_copy_headers(const char *response, char *out, unsigned int out_
 static mega_http_progress_fn g_progress_callback;
 static void *g_progress_user_data;
 
+static HMODULE
+mega_try_load_bear_tls_path(const WCHAR *path)
+{
+    if (path == 0 || path[0] == L'\0') {
+        return 0;
+    }
+    return LoadLibrary(path);
+}
+
+HMODULE
+mega_http_load_bear_tls_dll(void)
+{
+    static const WCHAR *fallback_paths[] = {
+        L"\\Program Files\\BearTLS\\wm_https.dll",
+        L"\\Storage Card\\Program Files\\BearTLS\\wm_https.dll",
+        L"\\CF Card\\Program Files\\BearTLS\\wm_https.dll",
+        L"\\SD Card\\Program Files\\BearTLS\\wm_https.dll"
+    };
+    HKEY key;
+    HMODULE dll;
+    WCHAR dll_path[MAX_PATH];
+    DWORD type;
+    DWORD bytes;
+    unsigned int i;
+
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, L"Software\\BearTLS",
+        0, KEY_READ, &key) == ERROR_SUCCESS)
+    {
+        memset(dll_path, 0, sizeof(dll_path));
+        type = 0;
+        bytes = sizeof(dll_path);
+        if (RegQueryValueEx(key, L"DllPath", 0, &type,
+            (LPBYTE)dll_path, &bytes) == ERROR_SUCCESS
+            && type == REG_SZ)
+        {
+            dll_path[(sizeof(dll_path) / sizeof(dll_path[0])) - 1] = L'\0';
+            dll = mega_try_load_bear_tls_path(dll_path);
+            if (dll != 0) {
+                RegCloseKey(key);
+                return dll;
+            }
+        }
+        RegCloseKey(key);
+    }
+
+    for (i = 0; i < sizeof(fallback_paths) / sizeof(fallback_paths[0]); ++i) {
+        dll = mega_try_load_bear_tls_path(fallback_paths[i]);
+        if (dll != 0) {
+            return dll;
+        }
+    }
+
+    return 0;
+}
+
 void
 mega_http_set_progress_callback(
     mega_http_progress_fn callback,
@@ -103,9 +158,9 @@ mega_load_tls(mega_tls_api *api, mega_http_result *result)
 {
     memset(api, 0, sizeof(*api));
 
-    api->dll = LoadLibrary(TEXT("wm_https.dll"));
+    api->dll = mega_http_load_bear_tls_dll();
     if (api->dll == 0) {
-        mega_result_error(result, "wm_https.dll not found");
+        mega_result_error(result, "BearTLS wm_https.dll not found");
         return 0;
     }
 
