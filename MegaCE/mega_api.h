@@ -42,7 +42,7 @@ typedef struct mega_node_info {
     int type;
     unsigned __int64 size;
     unsigned int mtime;
-    char name[96];
+    char name[256];
     int file_key_valid;
     unsigned char file_key[32];
 } mega_node_info;
@@ -111,6 +111,10 @@ int mega_api_find_root_node(void);
 int mega_api_find_node_by_handle(const char *handle);
 
 int mega_api_get_child_node(const char *parent, int child_offset, mega_node_info *node);
+
+int mega_api_get_first_child_index(const char *parent);
+
+int mega_api_get_next_sibling_index(int node_index);
 
 int mega_api_add_local_folder_node(
     const char *handle,

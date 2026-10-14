@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <windows.h>
+#include <wincrypt.h>
 #include "mega_crypto.h"
 #include "mega_http.h"
 
@@ -232,12 +233,10 @@ aes_inv_mix_columns(mega_byte *s)
 }
 
 static void
-aes_encrypt_block(const mega_byte *key, mega_byte *block)
+aes_encrypt_block_expanded(const mega_byte *round_key, mega_byte *block)
 {
-    mega_byte round_key[176];
     int round;
 
-    aes_key_expand(key, round_key);
     aes_add_round_key(block, round_key);
     for (round = 1; round < 10; ++round) {
         aes_sub_bytes(block);
@@ -250,16 +249,97 @@ aes_encrypt_block(const mega_byte *key, mega_byte *block)
     aes_add_round_key(block, round_key + 160);
 }
 
+static void
+aes_decrypt_block_expanded(const mega_byte *round_key, mega_byte *block)
+{
+    int round;
+
+    aes_add_round_key(block, round_key + 160);
+    for (round = 9; round > 0; --round) {
+        aes_inv_shift_rows(block);
+        aes_inv_sub_bytes(block);
+        aes_add_round_key(block, round_key + round * 16);
+        aes_inv_mix_columns(block);
+    }
+    aes_inv_shift_rows(block);
+    aes_inv_sub_bytes(block);
+    aes_add_round_key(block, round_key);
+}
+
+int
+mega_crypto_aes128_init(
+    mega_crypto_aes128_context *context,
+    const unsigned char *key
+)
+{
+    if (context == 0 || key == 0) {
+        return 0;
+    }
+    aes_key_expand((const mega_byte *)key, (mega_byte *)context->round_key);
+    return 1;
+}
+
+int
+mega_crypto_aes128_encrypt_context(
+    const mega_crypto_aes128_context *context,
+    unsigned char *block
+)
+{
+    if (context == 0 || block == 0) {
+        return 0;
+    }
+    aes_encrypt_block_expanded((const mega_byte *)context->round_key,
+        (mega_byte *)block);
+    return 1;
+}
+
+int
+mega_crypto_aes128_encrypt_blocks(
+    const mega_crypto_aes128_context *context,
+    unsigned char *blocks,
+    unsigned int block_count
+)
+{
+    unsigned int i;
+
+    if (context == 0 || blocks == 0) {
+        return 0;
+    }
+    for (i = 0; i < block_count; ++i) {
+        aes_encrypt_block_expanded((const mega_byte *)context->round_key,
+            (mega_byte *)(blocks + i * 16));
+    }
+    return 1;
+}
+
+int
+mega_crypto_aes128_decrypt_context(
+    const mega_crypto_aes128_context *context,
+    unsigned char *block
+)
+{
+    if (context == 0 || block == 0) {
+        return 0;
+    }
+    aes_decrypt_block_expanded((const mega_byte *)context->round_key,
+        (mega_byte *)block);
+    return 1;
+}
+
 int
 mega_crypto_aes128_encrypt_block(
     const unsigned char *key,
     unsigned char *block
 )
 {
+    mega_crypto_aes128_context context;
+
     if (key == 0 || block == 0) {
         return 0;
     }
-    aes_encrypt_block((const mega_byte *)key, (mega_byte *)block);
+    mega_crypto_aes128_init(&context, key);
+    mega_crypto_aes128_encrypt_context(&context, block);
+    mega_crypto_zero(&context, sizeof(context));
     return 1;
 }
 
@@ -269,26 +349,15 @@ mega_crypto_aes128_decrypt_block(
     unsigned char *block
 )
 {
-    mega_byte round_key[176];
-    int round;
+    mega_crypto_aes128_context context;
 
     if (key == 0 || block == 0) {
         return 0;
     }
 
-    aes_key_expand((const mega_byte *)key, round_key);
-    aes_add_round_key((mega_byte *)block, round_key + 160);
-    for (round = 9; round > 0; --round) {
-        aes_inv_shift_rows((mega_byte *)block);
-        aes_inv_sub_bytes((mega_byte *)block);
-        aes_add_round_key((mega_byte *)block, round_key + round * 16);
-        aes_inv_mix_columns((mega_byte *)block);
-    }
-    aes_inv_shift_rows((mega_byte *)block);
-    aes_inv_sub_bytes((mega_byte *)block);
-    aes_add_round_key((mega_byte *)block, round_key);
-
-    mega_crypto_zero(round_key, sizeof(round_key));
+    mega_crypto_aes128_init(&context, key);
+    mega_crypto_aes128_decrypt_context(&context, block);
+    mega_crypto_zero(&context, sizeof(context));
     return 1;
 }
 
@@ -418,28 +487,28 @@ mega_crypto_base64url_encode(
 int
 mega_crypto_random_bytes(unsigned char *buffer, unsigned int buffer_size)
 {
-    SYSTEMTIME st;
-    DWORD x;
-    unsigned int i;
+    HCRYPTPROV provider;
+    int ok;
 
     if (buffer == 0 && buffer_size > 0) {
         return 0;
     }
-
-    GetSystemTime(&st);
-    x = GetTickCount();
-    x ^= ((DWORD)st.wMilliseconds << 16) ^ (DWORD)st.wSecond;
-    x ^= ((DWORD)st.wMinute << 24) ^ ((DWORD)st.wHour << 8);
-    x ^= (DWORD)(unsigned long)buffer;
-
-    for (i = 0; i < buffer_size; ++i) {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        buffer[i] = (unsigned char)(x & 0xff);
+    if (buffer_size == 0) {
+        return 1;
     }
 
-    return 1;
+    provider = 0;
+    if (!CryptAcquireContext(&provider, 0, 0, PROV_RSA_FULL,
+        CRYPT_VERIFYCONTEXT | CRYPT_SILENT))
+    {
+        return 0;
+    }
+    ok = CryptGenRandom(provider, (DWORD)buffer_size, buffer) ? 1 : 0;
+    CryptReleaseContext(provider, 0);
+    if (!ok) {
+        mega_crypto_zero(buffer, buffer_size);
+    }
+    return ok;
 }
 
 static void
@@ -521,9 +590,12 @@ mega_crypto_self_test(char *report, unsigned int report_size)
         0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff
     };
     mega_byte aes_block[16];
+    mega_byte aes_bulk[32];
+    mega_crypto_aes128_context aes_context;
     char hash[32];
     int aes_ok;
     int aes_decrypt_ok;
+    int aes_bulk_ok;
     int hash_ok;
 
     aes_block[0] = 0x00; aes_block[1] = 0x11; aes_block[2] = 0x22; aes_block[3] = 0x33;
@@ -531,10 +603,17 @@ mega_crypto_self_test(char *report, unsigned int report_size)
     aes_block[8] = 0x88; aes_block[9] = 0x99; aes_block[10] = 0xaa; aes_block[11] = 0xbb;
     aes_block[12] = 0xcc; aes_block[13] = 0xdd; aes_block[14] = 0xee; aes_block[15] = 0xff;
 
-    aes_encrypt_block(aes_key, aes_block);
+    mega_crypto_aes128_init(&aes_context, aes_key);
+    mega_crypto_aes128_encrypt_context(&aes_context, aes_block);
     aes_ok = bytes_equal(aes_block, aes_expected, 16);
-    mega_crypto_aes128_decrypt_block(aes_key, aes_block);
+    memcpy(aes_bulk, aes_plain, 16);
+    memcpy(aes_bulk + 16, aes_plain, 16);
+    mega_crypto_aes128_encrypt_blocks(&aes_context, aes_bulk, 2);
+    aes_bulk_ok = bytes_equal(aes_bulk, aes_expected, 16)
+        && bytes_equal(aes_bulk + 16, aes_expected, 16);
+    mega_crypto_aes128_decrypt_context(&aes_context, aes_block);
     aes_decrypt_ok = bytes_equal(aes_block, aes_plain, 16);
+    mega_crypto_zero(&aes_context, sizeof(aes_context));
 
     hash[0] = '\0';
     hash_ok = mega_crypto_v1_user_hash("test@example.com", "password",
@@ -542,14 +621,16 @@ mega_crypto_self_test(char *report, unsigned int report_size)
 
     if (report != 0 && report_size > 0) {
         _snprintf(report, report_size,
-            "crypto self-test: AES=%s AESdec=%s sample_uh=%s",
+            "crypto self-test: AES=%s AESbulk=%s AESdec=%s sample_uh=%s",
             aes_ok ? "ok" : "FAIL",
+            aes_bulk_ok ? "ok" : "FAIL",
             aes_decrypt_ok ? "ok" : "FAIL",
             hash_ok ? hash : "(failed)");
         report[report_size - 1] = '\0';
     }
 
-    return aes_ok && aes_decrypt_ok && hash_ok;
+    mega_crypto_zero(aes_bulk, sizeof(aes_bulk));
+    return aes_ok && aes_bulk_ok && aes_decrypt_ok && hash_ok;
 }
 
 int
@@ -571,6 +652,7 @@ prepare_key_bytes(const char *password, mega_byte *out_key)
         0xd1,0xbe,0x3f,0x81,0x01,0x52,0xcb,0x56
     };
     mega_byte keys[16][16];
+    mega_crypto_aes128_context key_contexts[16];
     mega_byte key_buffer[16];
     int password_len;
     int block_count;
@@ -592,6 +674,7 @@ prepare_key_bytes(const char *password, mega_byte *out_key)
     }
 
     memset(keys, 0, sizeof(keys));
+    memset(key_contexts, 0, sizeof(key_contexts));
     for (block = 0; block < block_count; ++block) {
         int available;
 
@@ -600,17 +683,20 @@ prepare_key_bytes(const char *password, mega_byte *out_key)
             available = 16;
         }
         memcpy(keys[block], password + block * 16, available);
+        mega_crypto_aes128_init(&key_contexts[block], keys[block]);
     }
 
     memcpy(key_buffer, initial_key, sizeof(key_buffer));
     for (round = 0; round < 65536; ++round) {
         for (block = 0; block < block_count; ++block) {
-            aes_encrypt_block(keys[block], key_buffer);
+            mega_crypto_aes128_encrypt_context(&key_contexts[block],
+                key_buffer);
         }
     }
 
     memcpy(out_key, key_buffer, 16);
     mega_crypto_zero(keys, sizeof(keys));
+    mega_crypto_zero(key_contexts, sizeof(key_contexts));
     mega_crypto_zero(key_buffer, sizeof(key_buffer));
     return 1;
 }
@@ -625,6 +711,7 @@ v1_user_hash_sdk_bytes(
 {
     mega_byte password_key[16];
     mega_byte hash[16];
+    mega_crypto_aes128_context password_context;
     char lowered_email[256];
     int email_len;
     int full_len;
@@ -637,10 +724,12 @@ v1_user_hash_sdk_bytes(
     if (!prepare_key_bytes(password, password_key)) {
         return 0;
     }
+    mega_crypto_aes128_init(&password_context, password_key);
 
     ascii_lower_copy(email, lowered_email, sizeof(lowered_email));
     email_len = (int)strlen(lowered_email);
     if (email_len <= 0) {
+        mega_crypto_zero(&password_context, sizeof(password_context));
         mega_crypto_zero(password_key, sizeof(password_key));
         return 0;
     }
@@ -659,12 +748,13 @@ v1_user_hash_sdk_bytes(
     }
 
     for (i = 0; i < 16384; ++i) {
-        aes_encrypt_block(password_key, hash);
+        mega_crypto_aes128_encrypt_context(&password_context, hash);
     }
 
     memcpy(hash + 4, hash + 8, 4);
     i = mega_crypto_base64url_encode(hash, 8, user_hash, user_hash_size);
 
+    mega_crypto_zero(&password_context, sizeof(password_context));
     mega_crypto_zero(password_key, sizeof(password_key));
     mega_crypto_zero(hash, sizeof(hash));
     return i;

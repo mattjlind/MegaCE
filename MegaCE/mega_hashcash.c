@@ -516,6 +516,14 @@ mega_hashcash_solve(
 
             if ((group & 2047UL) == 2047UL) {
                 now_tick = GetTickCount();
+                if (mega_http_cancel_requested()) {
+                    mega_http_progress_message("Hashcash cancelled.");
+                    mega_crypto_zero(token_bin, sizeof(token_bin));
+                    mega_crypto_zero(digest, sizeof(digest));
+                    mega_crypto_zero(fixed_blocks, sizeof(fixed_blocks));
+                    mega_crypto_zero(first_block, sizeof(first_block));
+                    return 0;
+                }
                 if (now_tick - last_progress_tick >= 5000UL) {
                     char progress[112];
 

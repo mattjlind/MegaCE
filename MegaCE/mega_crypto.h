@@ -5,6 +5,10 @@
 extern "C" {
 #endif
 
+typedef struct mega_crypto_aes128_context {
+    unsigned char round_key[176];
+} mega_crypto_aes128_context;
+
 int mega_crypto_v1_user_hash(
     const char *email,
     const char *password,
@@ -32,6 +36,27 @@ int mega_crypto_aes128_decrypt_block(
 
 int mega_crypto_aes128_encrypt_block(
     const unsigned char *key,
+    unsigned char *block
+);
+
+int mega_crypto_aes128_init(
+    mega_crypto_aes128_context *context,
+    const unsigned char *key
+);
+
+int mega_crypto_aes128_encrypt_context(
+    const mega_crypto_aes128_context *context,
+    unsigned char *block
+);
+
+int mega_crypto_aes128_encrypt_blocks(
+    const mega_crypto_aes128_context *context,
+    unsigned char *blocks,
+    unsigned int block_count
+);
+
+int mega_crypto_aes128_decrypt_context(
+    const mega_crypto_aes128_context *context,
     unsigned char *block
 );
 

@@ -19,6 +19,8 @@
 #define WM_MEGACE_SERVER_OP_DONE (WM_APP + 5)
 #define WM_MEGACE_SYNC_STATUS (WM_APP + 6)
 #define WM_MEGACE_CONFLICT_DONE (WM_APP + 7)
+#define WM_MEGACE_SYNC_DETAILS (WM_APP + 8)
+#define WM_MEGACE_TRANSFER_PROGRESS (WM_APP + 9)
 
 #define MEGACE_VIEW_FILES 1
 #define MEGACE_VIEW_LOGIN 2
@@ -27,6 +29,7 @@
 #define MEGACE_VIEW_CREATE_FOLDER 5
 #define MEGACE_VIEW_RENAME 6
 #define MEGACE_VIEW_SYNC 7
+#define MEGACE_VIEW_CONFLICTS 8
 #define MEGACE_RESPONSE_SMALL_SIZE 65536U
 #define MEGACE_FILE_ICON_FILE   0
 #define MEGACE_FILE_ICON_FOLDER 1
@@ -45,11 +48,22 @@
 #define MEGACE_DOWNLOAD_MODE_MANUAL 0
 #define MEGACE_DOWNLOAD_MODE_SYNC 1
 #define MEGACE_MAX_SYNC_CONFLICTS 16
+#define MEGACE_LOG_MAX_ENTRIES 500
+#define MEGACE_LOG_MAX_CHARS 65536
+#define MEGACE_LOG_RETAIN_CHARS 49152
+#define MEGACE_WIDE_ARENA_CHARS 8192
+#define MEGACE_SYNC_IO_BUFFER_SIZE 32768U
 #define MEGACE_SYNC_STATE_MAGIC "MCESST1"
-#define MEGACE_SYNC_STATE_VERSION 1
+#define MEGACE_SYNC_STATE_VERSION 2
+#define MEGACE_MAC_CHUNK_BASE 131072UL
+#define MEGACE_MAC_CHUNK_MAX 1048576UL
 #define MEGACE_SERVER_OP_CREATE_FOLDER 1
 #define MEGACE_SERVER_OP_RENAME 2
 #define MEGACE_SERVER_OP_DELETE 3
+#define MEGACE_CONFLICT_FILE 1
+#define MEGACE_CONFLICT_REMOTE_FILE_DELETED 2
+#define MEGACE_CONFLICT_REMOTE_FOLDER_DELETED 3
+#define MEGACE_CONFLICT_LOCAL_FOLDER_DELETED 4
 #define MEGACE_INPUT_CLASS_NAME TEXT("MegaCEInputWindow")
 #ifndef ILC_COLOR32
 #define ILC_COLOR32 0x00000020
@@ -68,6 +82,17 @@ static HWND g_text_size_label;
 static HWND g_text_size_edit;
 static HWND g_sync_status_label;
 static HWND g_sync_progress;
+static HWND g_sync_transfer_progress;
+static HWND g_sync_context_label;
+static HWND g_sync_current_label;
+static HWND g_sync_summary_label;
+static HWND g_sync_cancel;
+static HWND g_conflict_list;
+static HWND g_conflict_detail;
+static HWND g_conflict_keep_local;
+static HWND g_conflict_keep_mega;
+static HWND g_conflict_skip;
+static HWND g_conflict_apply;
 static HWND g_create_folder_label;
 static HWND g_create_folder_name;
 static HWND g_rename_label;
@@ -75,6 +100,8 @@ static HWND g_rename_name;
 static HWND g_spinner;
 static HFONT g_app_font;
 static LONG g_probe_running;
+static LONG g_sync_running;
+static LONG g_sync_cancel_requested;
 static int g_probe_mode;
 static char g_probe_email[256];
 static char g_probe_password[256];
@@ -90,6 +117,8 @@ static int g_file_sort_column;
 static int g_file_sort_reverse;
 static int g_spinner_frame;
 static int g_spinner_active;
+static int g_sync_scroll_pos;
+static int g_sync_scroll_max;
 static int g_rename_node_index = -1;
 static int g_dpi_x = MEGACE_BASE_DPI;
 static int g_dpi_y = MEGACE_BASE_DPI;
@@ -111,7 +140,9 @@ typedef struct sync_conflict_entry {
     mega_node_info node;
     WCHAR path[MAX_PATH];
     WCHAR name[128];
+    int kind;
     int choice;
+    int resolved;
 } sync_conflict_entry;
 
 typedef struct sync_state_header {
@@ -127,8 +158,18 @@ typedef struct sync_state_record {
     unsigned __int64 local_size;
     unsigned int local_mtime;
     int type;
-    WCHAR local_path[MAX_PATH];
+    WCHAR *local_path;
 } sync_state_record;
+
+typedef struct sync_state_record_v1_with_path {
+    char handle[16];
+    unsigned __int64 remote_size;
+    unsigned int remote_mtime;
+    unsigned __int64 local_size;
+    unsigned int local_mtime;
+    int type;
+    WCHAR local_path[MAX_PATH];
+} sync_state_record_v1_with_path;
 
 typedef struct sync_state_record_v1 {
     char handle[16];
@@ -139,23 +180,121 @@ typedef struct sync_state_record_v1 {
     int type;
 } sync_state_record_v1;
 
+typedef struct sync_state_record_v2_disk {
+    char handle[16];
+    unsigned __int64 remote_size;
+    unsigned int remote_mtime;
+    unsigned __int64 local_size;
+    unsigned int local_mtime;
+    int type;
+    unsigned int path_chars;
+} sync_state_record_v2_disk;
+
+typedef struct sync_ui_details {
+    int files_seen;
+    int files_in_scope;
+    int downloaded;
+    int uploaded;
+    int folders;
+    int skipped;
+    int pending;
+    int conflicts;
+    int failed;
+    DWORD total_ms;
+    DWORD refresh_ms;
+    DWORD scan_ms;
+    DWORD remote_ms;
+    DWORD upload_ms;
+    DWORD state_ms;
+    WCHAR current_action[24];
+    WCHAR current_item[128];
+} sync_ui_details;
+
 typedef struct file_sort_entry {
     int node_index;
     mega_node_info node;
     WCHAR label[160];
 } file_sort_entry;
 
+typedef struct remote_name_cache_entry {
+    char handle[16];
+    char parent[16];
+    int type;
+    WCHAR *component;
+    WCHAR *relative_path;
+    int relative_path_state;
+    int needs_suffix;
+} remote_name_cache_entry;
+
+typedef struct local_snapshot_entry {
+    WCHAR *path;
+    int parent_index;
+    int first_child;
+    int next_sibling;
+    DWORD attributes;
+    unsigned __int64 size;
+    unsigned int mtime;
+} local_snapshot_entry;
+
+typedef struct wide_arena_block {
+    struct wide_arena_block *next;
+    unsigned int used;
+    unsigned int capacity;
+} wide_arena_block;
+
+typedef struct sync_buffered_io {
+    HANDLE file;
+    unsigned char *buffer;
+    unsigned int position;
+    unsigned int used;
+} sync_buffered_io;
+
 static sync_state_record *g_sync_state_records;
 static int g_sync_state_count;
 static int g_sync_state_capacity;
+static int *g_sync_handle_slots;
+static int *g_sync_path_slots;
+static int g_sync_index_capacity;
+static int g_sync_handle_slots_used;
+static int g_sync_path_slots_used;
 static sync_conflict_entry g_sync_conflicts[MEGACE_MAX_SYNC_CONFLICTS];
 static int g_sync_conflict_count;
+static int g_sync_folder_conflict_overflow;
+static int g_sync_remote_folder_conflict_overflow;
+static int g_last_sync_status_progress = -1;
+static WCHAR g_last_sync_status_text[64];
+static DWORD g_last_sync_details_tick;
+static DWORD g_sync_total_ms;
+static DWORD g_sync_refresh_ms;
+static DWORD g_sync_scan_ms;
+static DWORD g_sync_remote_ms;
+static DWORD g_sync_upload_ms;
+static DWORD g_sync_state_ms;
+static remote_name_cache_entry *g_remote_name_cache;
+static int g_remote_name_cache_count;
+static int *g_remote_name_slots;
+static int g_remote_name_slot_count;
+static wide_arena_block *g_remote_name_arena;
+static unsigned char *g_node_scope_cache;
+static int g_node_scope_cache_count;
+static local_snapshot_entry *g_local_snapshot;
+static int g_local_snapshot_count;
+static int g_local_snapshot_capacity;
+static int *g_local_snapshot_slots;
+static int g_local_snapshot_slot_count;
+static wide_arena_block *g_local_snapshot_arena;
+static int g_sync_defer_index_rebuild;
 
 static void save_session_to_file(void);
 static void layout_children(HWND hwnd);
 static void populate_file_list(void);
 static int build_app_file_path(const WCHAR *file_name, WCHAR *path, unsigned int path_size);
 static void http_progress_callback(const char *message, void *user_data);
+static void http_transfer_progress_callback(
+    unsigned __int64 bytes_done,
+    unsigned __int64 bytes_total,
+    void *user_data
+);
 static void show_file_context_menu(HWND hwnd);
 static void start_server_operation(HWND hwnd, int op_type, int node_index);
 static void set_current_parent_from_root(void);
@@ -163,6 +302,21 @@ static void show_rename_page(HWND hwnd, int node_index);
 static void setup_file_icons(void);
 static void recalculate_icon_size(void);
 static void post_sync_status(const WCHAR *text, int progress);
+static void post_sync_details(
+    const WCHAR *current_item,
+    const WCHAR *current_action,
+    int files_seen,
+    int files_in_scope,
+    int downloaded,
+    int uploaded,
+    int folders,
+    int skipped,
+    int pending,
+    int conflicts,
+    int failed,
+    int force
+);
+static int sync_cancel_callback(void *user_data);
 static int get_local_file_state(
     const WCHAR *path,
     unsigned __int64 *size,
@@ -172,11 +326,18 @@ static int sync_state_upsert_file(
     const mega_node_info *node,
     const WCHAR *plain_path
 );
+static int sync_state_upsert_file_known(
+    const mega_node_info *node,
+    const WCHAR *plain_path,
+    unsigned __int64 local_size,
+    unsigned int local_mtime
+);
 static int sync_state_upsert_folder(
     const mega_node_info *node,
     const WCHAR *plain_path
 );
 static int sync_state_upsert_pending_local(const WCHAR *plain_path);
+static sync_state_record *sync_state_find_by_path(const WCHAR *plain_path);
 static unsigned int filetime_to_unix_time(const FILETIME *ft);
 
 static int
@@ -291,6 +452,16 @@ apply_app_font(HWND hwnd)
     set_child_font(g_text_size_label);
     set_child_font(g_text_size_edit);
     set_child_font(g_sync_status_label);
+    set_child_font(g_sync_context_label);
+    set_child_font(g_sync_current_label);
+    set_child_font(g_sync_summary_label);
+    set_child_font(g_sync_cancel);
+    set_child_font(g_conflict_list);
+    set_child_font(g_conflict_detail);
+    set_child_font(g_conflict_keep_local);
+    set_child_font(g_conflict_keep_mega);
+    set_child_font(g_conflict_skip);
+    set_child_font(g_conflict_apply);
     set_child_font(g_create_folder_label);
     set_child_font(g_create_folder_name);
     set_child_font(g_rename_label);
@@ -317,19 +488,120 @@ post_sync_status(const WCHAR *text, int progress)
     if (progress > 100) {
         progress = 100;
     }
+    if (g_last_sync_status_progress == progress
+        && wcscmp(g_last_sync_status_text, text) == 0)
+    {
+        return;
+    }
     len = wcslen(text) + 1;
     copy = (WCHAR *)LocalAlloc(LPTR, len * sizeof(WCHAR));
     if (copy == 0) {
         return;
     }
     memcpy(copy, text, len * sizeof(WCHAR));
+    g_last_sync_status_progress = progress;
+    _snwprintf(g_last_sync_status_text,
+        sizeof(g_last_sync_status_text) / sizeof(g_last_sync_status_text[0]),
+        L"%s", text);
+    g_last_sync_status_text[(sizeof(g_last_sync_status_text)
+        / sizeof(g_last_sync_status_text[0])) - 1] = L'\0';
     PostMessage(g_main_window, WM_MEGACE_SYNC_STATUS,
         (WPARAM)progress, (LPARAM)copy);
+}
+
+static int
+sync_cancel_callback(void *user_data)
+{
+    (void)user_data;
+    return InterlockedCompareExchange(&g_sync_cancel_requested, 0, 0) != 0;
+}
+
+static void
+post_sync_details(
+    const WCHAR *current_item,
+    const WCHAR *current_action,
+    int files_seen,
+    int files_in_scope,
+    int downloaded,
+    int uploaded,
+    int folders,
+    int skipped,
+    int pending,
+    int conflicts,
+    int failed,
+    int force
+)
+{
+    sync_ui_details *details;
+    DWORD now;
+
+    if (g_main_window == 0 || current_item == 0) {
+        return;
+    }
+    now = GetTickCount();
+    if (!force && g_last_sync_details_tick != 0
+        && (DWORD)(now - g_last_sync_details_tick) < 250)
+    {
+        return;
+    }
+    details = (sync_ui_details *)LocalAlloc(LPTR, sizeof(*details));
+    if (details == 0) {
+        return;
+    }
+    details->files_seen = files_seen;
+    details->files_in_scope = files_in_scope;
+    details->downloaded = downloaded;
+    details->uploaded = uploaded;
+    details->folders = folders;
+    details->skipped = skipped;
+    details->pending = pending;
+    details->conflicts = conflicts;
+    details->failed = failed;
+    details->total_ms = g_sync_total_ms;
+    details->refresh_ms = g_sync_refresh_ms;
+    details->scan_ms = g_sync_scan_ms;
+    details->remote_ms = g_sync_remote_ms;
+    details->upload_ms = g_sync_upload_ms;
+    details->state_ms = g_sync_state_ms;
+    if (current_action != 0) {
+        _snwprintf(details->current_action,
+            sizeof(details->current_action)
+                / sizeof(details->current_action[0]),
+            L"%s", current_action);
+        details->current_action[(sizeof(details->current_action)
+            / sizeof(details->current_action[0])) - 1] = L'\0';
+    }
+    _snwprintf(details->current_item,
+        sizeof(details->current_item) / sizeof(details->current_item[0]),
+        L"%s", current_item);
+    details->current_item[(sizeof(details->current_item)
+        / sizeof(details->current_item[0])) - 1] = L'\0';
+    g_last_sync_details_tick = now;
+    if (!PostMessage(g_main_window, WM_MEGACE_SYNC_DETAILS,
+        0, (LPARAM)details))
+    {
+        LocalFree((HLOCAL)details);
+    }
 }
 
 static void
 reset_sync_page(const WCHAR *text)
 {
+    WCHAR context[384];
+
+    g_last_sync_status_progress = -1;
+    g_last_sync_status_text[0] = L'\0';
+    g_last_sync_details_tick = 0;
+    g_sync_total_ms = 0;
+    g_sync_refresh_ms = 0;
+    g_sync_scan_ms = 0;
+    g_sync_remote_ms = 0;
+    g_sync_upload_ms = 0;
+    g_sync_state_ms = 0;
+    g_sync_scroll_pos = 0;
+    if (g_main_window != 0) {
+        SetScrollPos(g_main_window, SB_VERT, 0, TRUE);
+    }
     if (g_sync_status_label != 0) {
         SetWindowText(g_sync_status_label,
             text != 0 ? text : TEXT("Ready to sync"));
@@ -337,6 +609,31 @@ reset_sync_page(const WCHAR *text)
     if (g_sync_progress != 0) {
         SendMessage(g_sync_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
         SendMessage(g_sync_progress, PBM_SETPOS, 0, 0);
+    }
+    if (g_sync_transfer_progress != 0) {
+        SendMessage(g_sync_transfer_progress, PBM_SETRANGE, 0,
+            MAKELPARAM(0, 100));
+        SendMessage(g_sync_transfer_progress, PBM_SETPOS, 0, 0);
+    }
+    if (g_sync_context_label != 0) {
+        _snwprintf(context, sizeof(context) / sizeof(context[0]),
+            g_sync_handle_count > 0
+                ? L"Local: %s\r\nMEGA: %d selected folder%s"
+                : L"Local: %s\r\nMEGA: Entire cloud",
+            g_sync_directory,
+            g_sync_handle_count,
+            g_sync_handle_count == 1 ? L"" : L"s");
+        context[(sizeof(context) / sizeof(context[0])) - 1] = L'\0';
+        SetWindowText(g_sync_context_label, context);
+    }
+    if (g_sync_current_label != 0) {
+        SetWindowText(g_sync_current_label, TEXT("Current: Waiting..."));
+    }
+    if (g_sync_summary_label != 0) {
+        SetWindowText(g_sync_summary_label,
+            TEXT("Files: 0 scope / 0 seen\r\n")
+            TEXT("Down 0  Up 0  Folders 0  Skip 0\r\n")
+            TEXT("Pending 0  Conflicts 0  Failed 0"));
     }
 }
 
@@ -492,6 +789,8 @@ append_log_text(const WCHAR *text)
 {
     int len;
     int end;
+    int line_count;
+    int remove_chars;
 
     if (g_log == 0 || text == 0) {
         return;
@@ -502,6 +801,36 @@ append_log_text(const WCHAR *text)
     SendMessage(g_log, EM_SETSEL, (WPARAM)end, (LPARAM)end);
     SendMessage(g_log, EM_REPLACESEL, FALSE, (LPARAM)text);
     SendMessage(g_log, EM_REPLACESEL, FALSE, (LPARAM)TEXT("\r\n"));
+
+    remove_chars = 0;
+    line_count = (int)SendMessage(g_log, EM_GETLINECOUNT, 0, 0);
+    if (line_count > MEGACE_LOG_MAX_ENTRIES + 1) {
+        int first_retained_line;
+
+        first_retained_line = line_count - (MEGACE_LOG_MAX_ENTRIES + 1);
+        remove_chars = (int)SendMessage(g_log, EM_LINEINDEX,
+            (WPARAM)first_retained_line, 0);
+        if (remove_chars < 0) {
+            remove_chars = 0;
+        }
+    }
+
+    len = GetWindowTextLength(g_log);
+    if (len > MEGACE_LOG_MAX_CHARS) {
+        int size_remove_chars;
+
+        size_remove_chars = len - MEGACE_LOG_RETAIN_CHARS;
+        if (size_remove_chars > remove_chars) {
+            remove_chars = size_remove_chars;
+        }
+    }
+    if (remove_chars > 0) {
+        SendMessage(g_log, WM_SETREDRAW, FALSE, 0);
+        SendMessage(g_log, EM_SETSEL, 0, (LPARAM)remove_chars);
+        SendMessage(g_log, EM_REPLACESEL, FALSE, (LPARAM)TEXT(""));
+        SendMessage(g_log, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g_log, 0, FALSE);
+    }
 }
 
 static void
@@ -541,6 +870,50 @@ set_view_mode(HWND hwnd, int view_mode)
     if (g_sync_progress != 0) {
         ShowWindow(g_sync_progress,
             view_mode == MEGACE_VIEW_SYNC ? SW_SHOW : SW_HIDE);
+    }
+    if (g_sync_transfer_progress != 0) {
+        ShowWindow(g_sync_transfer_progress,
+            view_mode == MEGACE_VIEW_SYNC ? SW_SHOW : SW_HIDE);
+    }
+    if (g_sync_context_label != 0) {
+        ShowWindow(g_sync_context_label,
+            view_mode == MEGACE_VIEW_SYNC ? SW_SHOW : SW_HIDE);
+    }
+    if (g_sync_current_label != 0) {
+        ShowWindow(g_sync_current_label,
+            view_mode == MEGACE_VIEW_SYNC ? SW_SHOW : SW_HIDE);
+    }
+    if (g_sync_summary_label != 0) {
+        ShowWindow(g_sync_summary_label,
+            view_mode == MEGACE_VIEW_SYNC ? SW_SHOW : SW_HIDE);
+    }
+    if (g_sync_cancel != 0) {
+        ShowWindow(g_sync_cancel,
+            view_mode == MEGACE_VIEW_SYNC ? SW_SHOW : SW_HIDE);
+    }
+    if (g_conflict_list != 0) {
+        ShowWindow(g_conflict_list,
+            view_mode == MEGACE_VIEW_CONFLICTS ? SW_SHOW : SW_HIDE);
+    }
+    if (g_conflict_detail != 0) {
+        ShowWindow(g_conflict_detail,
+            view_mode == MEGACE_VIEW_CONFLICTS ? SW_SHOW : SW_HIDE);
+    }
+    if (g_conflict_keep_local != 0) {
+        ShowWindow(g_conflict_keep_local,
+            view_mode == MEGACE_VIEW_CONFLICTS ? SW_SHOW : SW_HIDE);
+    }
+    if (g_conflict_keep_mega != 0) {
+        ShowWindow(g_conflict_keep_mega,
+            view_mode == MEGACE_VIEW_CONFLICTS ? SW_SHOW : SW_HIDE);
+    }
+    if (g_conflict_skip != 0) {
+        ShowWindow(g_conflict_skip,
+            view_mode == MEGACE_VIEW_CONFLICTS ? SW_SHOW : SW_HIDE);
+    }
+    if (g_conflict_apply != 0) {
+        ShowWindow(g_conflict_apply,
+            view_mode == MEGACE_VIEW_CONFLICTS ? SW_SHOW : SW_HIDE);
     }
     if (g_create_folder_label != 0) {
         ShowWindow(g_create_folder_label,
@@ -1346,18 +1719,44 @@ static void
 sanitize_file_name(WCHAR *name)
 {
     unsigned int i;
+    unsigned int len;
+    unsigned int stem_len;
 
     if (name == 0 || name[0] == L'\0') {
         return;
     }
 
     for (i = 0; name[i] != L'\0'; ++i) {
-        if (name[i] == L'\\' || name[i] == L'/' || name[i] == L':'
+        if (name[i] < 32 || name[i] == L'\\' || name[i] == L'/' || name[i] == L':'
             || name[i] == L'*' || name[i] == L'?' || name[i] == L'"'
             || name[i] == L'<' || name[i] == L'>' || name[i] == L'|')
         {
             name[i] = L'_';
         }
+    }
+    len = (unsigned int)wcslen(name);
+    while (len > 0 && (name[len - 1] == L'.' || name[len - 1] == L' ')) {
+        name[--len] = L'_';
+    }
+    if (name[0] == L'\0') {
+        name[0] = L'_';
+        name[1] = L'\0';
+    }
+    stem_len = 0;
+    while (name[stem_len] != L'\0' && name[stem_len] != L'.') {
+        stem_len++;
+    }
+    if ((stem_len == 3
+            && (_wcsnicmp(name, L"CON", 3) == 0
+                || _wcsnicmp(name, L"PRN", 3) == 0
+                || _wcsnicmp(name, L"AUX", 3) == 0
+                || _wcsnicmp(name, L"NUL", 3) == 0))
+        || (stem_len == 4
+            && (_wcsnicmp(name, L"COM", 3) == 0
+                || _wcsnicmp(name, L"LPT", 3) == 0)
+            && name[3] >= L'1' && name[3] <= L'9'))
+    {
+        name[0] = L'_';
     }
 }
 
@@ -1380,6 +1779,366 @@ node_name_to_wide(const mega_node_info *node, WCHAR *name, unsigned int name_siz
     }
     name[name_size - 1] = L'\0';
     sanitize_file_name(name);
+}
+
+static int
+make_node_local_component(
+    const mega_node_info *node,
+    WCHAR *name,
+    unsigned int name_size,
+    int *truncated
+)
+{
+    WCHAR converted[256];
+    const char *source;
+    int required;
+    unsigned int copy_chars;
+
+    if (truncated != 0) {
+        *truncated = 0;
+    }
+    if (node == 0 || name == 0 || name_size < 2) {
+        return 0;
+    }
+    source = node->name[0] != '\0' ? node->name : node->handle;
+    required = MultiByteToWideChar(CP_UTF8, 0, source, -1, converted,
+        sizeof(converted) / sizeof(converted[0]));
+    if (required <= 0) {
+        required = MultiByteToWideChar(CP_ACP, 0, source, -1, converted,
+            sizeof(converted) / sizeof(converted[0]));
+    }
+    if (required <= 0) {
+        return 0;
+    }
+    converted[(sizeof(converted) / sizeof(converted[0])) - 1] = L'\0';
+    copy_chars = (unsigned int)wcslen(converted);
+    if (copy_chars >= name_size) {
+        copy_chars = name_size - 1;
+        if (truncated != 0) {
+            *truncated = 1;
+        }
+    }
+    memcpy(name, converted, copy_chars * sizeof(WCHAR));
+    name[copy_chars] = L'\0';
+    sanitize_file_name(name);
+    return 1;
+}
+
+static int
+append_component_handle_suffix(
+    const mega_node_info *node,
+    WCHAR *name,
+    unsigned int name_size
+)
+{
+    WCHAR suffix[24];
+    WCHAR handle_wide[16];
+    unsigned int suffix_len;
+    unsigned int base_len;
+
+    handle_wide[0] = L'\0';
+    MultiByteToWideChar(CP_ACP, 0, node->handle, -1, handle_wide,
+        sizeof(handle_wide) / sizeof(handle_wide[0]));
+    handle_wide[(sizeof(handle_wide) / sizeof(handle_wide[0])) - 1] = L'\0';
+    _snwprintf(suffix, sizeof(suffix) / sizeof(suffix[0]),
+        L"~%s", handle_wide);
+    suffix[(sizeof(suffix) / sizeof(suffix[0])) - 1] = L'\0';
+    suffix_len = (unsigned int)wcslen(suffix);
+    if (suffix_len + 1 >= name_size) {
+        return 0;
+    }
+    base_len = (unsigned int)wcslen(name);
+    if (base_len + suffix_len >= name_size) {
+        base_len = name_size - suffix_len - 1;
+        name[base_len] = L'\0';
+    }
+    wcscat(name, suffix);
+    return 1;
+}
+
+static unsigned int
+remote_name_hash(const char *parent, int type, const WCHAR *name)
+{
+    unsigned int hash;
+
+    hash = 2166136261UL;
+    while (parent != 0 && *parent != '\0') {
+        hash ^= (unsigned char)*parent++;
+        hash *= 16777619UL;
+    }
+    hash ^= (unsigned int)type;
+    hash *= 16777619UL;
+    while (name != 0 && *name != L'\0') {
+        WCHAR c;
+
+        c = *name++;
+        if (c >= L'A' && c <= L'Z') {
+            c = (WCHAR)(c - L'A' + L'a');
+        }
+        hash ^= (unsigned int)c;
+        hash *= 16777619UL;
+    }
+    return hash;
+}
+
+static WCHAR *
+wide_arena_alloc(wide_arena_block **arena, unsigned int chars)
+{
+    wide_arena_block *block;
+    WCHAR *data;
+    unsigned int capacity;
+
+    if (arena == 0 || chars == 0) {
+        return 0;
+    }
+    block = *arena;
+    if (block == 0 || block->capacity - block->used < chars) {
+        capacity = chars > MEGACE_WIDE_ARENA_CHARS
+            ? chars : MEGACE_WIDE_ARENA_CHARS;
+        block = (wide_arena_block *)LocalAlloc(LPTR,
+            sizeof(wide_arena_block) + capacity * sizeof(WCHAR));
+        if (block == 0) {
+            return 0;
+        }
+        block->next = *arena;
+        block->capacity = capacity;
+        *arena = block;
+    }
+    data = (WCHAR *)(block + 1);
+    data += block->used;
+    block->used += chars;
+    return data;
+}
+
+static void
+wide_arena_free(wide_arena_block **arena)
+{
+    wide_arena_block *block;
+
+    if (arena == 0) {
+        return;
+    }
+    block = *arena;
+    while (block != 0) {
+        wide_arena_block *next;
+
+        next = block->next;
+        LocalFree((HLOCAL)block);
+        block = next;
+    }
+    *arena = 0;
+}
+
+static void
+remote_name_cache_free(void)
+{
+    if (g_remote_name_cache != 0) {
+        LocalFree((HLOCAL)g_remote_name_cache);
+    }
+    if (g_remote_name_slots != 0) {
+        LocalFree((HLOCAL)g_remote_name_slots);
+    }
+    wide_arena_free(&g_remote_name_arena);
+    g_remote_name_cache = 0;
+    g_remote_name_cache_count = 0;
+    g_remote_name_slots = 0;
+    g_remote_name_slot_count = 0;
+}
+
+static int
+remote_name_order_compare(const void *left, const void *right)
+{
+    int left_index;
+    int right_index;
+    int result;
+
+    left_index = *(const int *)left;
+    right_index = *(const int *)right;
+    result = strcmp(g_remote_name_cache[left_index].parent,
+        g_remote_name_cache[right_index].parent);
+    if (result != 0) {
+        return result;
+    }
+    return _wcsicmp(g_remote_name_cache[left_index].component,
+        g_remote_name_cache[right_index].component);
+}
+
+static int
+remote_name_cache_build(void)
+{
+    int total;
+    int *order;
+    int i;
+    int capacity;
+
+    remote_name_cache_free();
+    total = mega_api_get_node_count();
+    if (total <= 0) {
+        return 1;
+    }
+    g_remote_name_cache = (remote_name_cache_entry *)LocalAlloc(LPTR,
+        sizeof(remote_name_cache_entry) * (unsigned int)total);
+    order = (int *)LocalAlloc(LPTR, sizeof(int) * (unsigned int)total);
+    if (g_remote_name_cache == 0 || order == 0) {
+        if (order != 0) {
+            LocalFree((HLOCAL)order);
+        }
+        remote_name_cache_free();
+        return 0;
+    }
+    g_remote_name_cache_count = total;
+    for (i = 0; i < total; ++i) {
+        mega_node_info node;
+        WCHAR component[128];
+        unsigned int chars;
+        int truncated;
+
+        order[i] = i;
+        truncated = 0;
+        if (!mega_api_get_node(i, &node)
+            || !make_node_local_component(&node, component,
+                sizeof(component) / sizeof(component[0]), &truncated))
+        {
+            component[0] = L'_';
+            component[1] = L'\0';
+            memset(&node, 0, sizeof(node));
+        }
+        memcpy(g_remote_name_cache[i].handle, node.handle,
+            sizeof(g_remote_name_cache[i].handle));
+        memcpy(g_remote_name_cache[i].parent, node.parent,
+            sizeof(g_remote_name_cache[i].parent));
+        g_remote_name_cache[i].type = node.type;
+        g_remote_name_cache[i].needs_suffix = truncated;
+        chars = (unsigned int)wcslen(component) + 24;
+        g_remote_name_cache[i].component = wide_arena_alloc(
+            &g_remote_name_arena, chars);
+        if (g_remote_name_cache[i].component == 0) {
+            LocalFree((HLOCAL)order);
+            remote_name_cache_free();
+            return 0;
+        }
+        _snwprintf(g_remote_name_cache[i].component, chars, L"%s",
+            component);
+        g_remote_name_cache[i].component[chars - 1] = L'\0';
+    }
+
+    qsort(order, (size_t)total, sizeof(int), remote_name_order_compare);
+    i = 0;
+    while (i < total) {
+        int end;
+
+        end = i + 1;
+        while (end < total
+            && strcmp(g_remote_name_cache[order[i]].parent,
+                g_remote_name_cache[order[end]].parent) == 0
+            && _wcsicmp(g_remote_name_cache[order[i]].component,
+                g_remote_name_cache[order[end]].component) == 0)
+        {
+            end++;
+        }
+        if (end - i > 1) {
+            int mark;
+
+            for (mark = i; mark < end; ++mark) {
+                g_remote_name_cache[order[mark]].needs_suffix = 1;
+            }
+        }
+        i = end;
+    }
+    LocalFree((HLOCAL)order);
+
+    capacity = 16;
+    while (capacity < total * 2) {
+        capacity *= 2;
+    }
+    g_remote_name_slots = (int *)LocalAlloc(LPTR,
+        sizeof(int) * (unsigned int)capacity);
+    if (g_remote_name_slots == 0) {
+        remote_name_cache_free();
+        return 0;
+    }
+    memset(g_remote_name_slots, 0xff,
+        sizeof(int) * (unsigned int)capacity);
+    g_remote_name_slot_count = capacity;
+
+    for (i = 0; i < total; ++i) {
+        mega_node_info node;
+        unsigned int slot;
+        unsigned int mask;
+
+        if (!mega_api_get_node(i, &node)) {
+            continue;
+        }
+        if (g_remote_name_cache[i].needs_suffix
+            && !append_component_handle_suffix(&node,
+                g_remote_name_cache[i].component,
+                (unsigned int)wcslen(g_remote_name_cache[i].component) + 24))
+        {
+            remote_name_cache_free();
+            return 0;
+        }
+        mask = (unsigned int)capacity - 1;
+        slot = remote_name_hash(node.parent, node.type,
+            g_remote_name_cache[i].component) & mask;
+        while (g_remote_name_slots[slot] >= 0) {
+            slot = (slot + 1) & mask;
+        }
+        g_remote_name_slots[slot] = i;
+    }
+    return 1;
+}
+
+static int
+node_name_to_local_component(
+    int node_index,
+    WCHAR *name,
+    unsigned int name_size
+)
+{
+    mega_node_info node;
+    int truncated;
+    int collision;
+    int sibling_index;
+
+    if (node_index >= 0 && node_index < g_remote_name_cache_count
+        && g_remote_name_cache != 0
+        && g_remote_name_cache[node_index].component != 0
+        && mega_api_get_node(node_index, &node)
+        && strcmp(node.handle, g_remote_name_cache[node_index].handle) == 0)
+    {
+        _snwprintf(name, name_size, L"%s",
+            g_remote_name_cache[node_index].component);
+        name[name_size - 1] = L'\0';
+        return 1;
+    }
+    if (!mega_api_get_node(node_index, &node)
+        || !make_node_local_component(&node, name, name_size, &truncated))
+    {
+        return 0;
+    }
+    collision = truncated;
+    sibling_index = mega_api_get_first_child_index(node.parent);
+    while (!collision && sibling_index >= 0) {
+        mega_node_info sibling;
+
+        if (sibling_index != node_index
+            && mega_api_get_node(sibling_index, &sibling))
+        {
+            WCHAR sibling_name[128];
+
+            if (make_node_local_component(&sibling, sibling_name,
+                sizeof(sibling_name) / sizeof(sibling_name[0]), 0)
+                && _wcsicmp(name, sibling_name) == 0)
+            {
+                collision = 1;
+            }
+        }
+        sibling_index = mega_api_get_next_sibling_index(sibling_index);
+    }
+    if (collision) {
+        return append_component_handle_suffix(&node, name, name_size);
+    }
+    return 1;
 }
 
 static void
@@ -1564,9 +2323,80 @@ append_path_part(WCHAR *path, unsigned int path_size, const WCHAR *part)
 }
 
 static int
+get_cached_folder_relative_path(
+    int node_index,
+    WCHAR *path,
+    unsigned int path_size
+)
+{
+    remote_name_cache_entry *entry;
+    mega_node_info node;
+    WCHAR built[MAX_PATH];
+    unsigned int chars;
+
+    if (path == 0 || path_size == 0 || node_index < 0
+        || node_index >= g_remote_name_cache_count
+        || g_remote_name_cache == 0
+        || !mega_api_get_node(node_index, &node)
+        || (node.type != 1 && node.type != 2))
+    {
+        return 0;
+    }
+    entry = &g_remote_name_cache[node_index];
+    if (strcmp(entry->handle, node.handle) != 0) {
+        return 0;
+    }
+    if (entry->relative_path != 0) {
+        if (wcslen(entry->relative_path) >= path_size) {
+            return 0;
+        }
+        _snwprintf(path, path_size, L"%s", entry->relative_path);
+        path[path_size - 1] = L'\0';
+        return 1;
+    }
+    if (entry->relative_path_state != 0) {
+        return 0;
+    }
+    entry->relative_path_state = 1;
+    built[0] = L'\0';
+    if (node.type != 2) {
+        int parent_index;
+
+        parent_index = mega_api_find_node_by_handle(node.parent);
+        if (parent_index >= 0
+            && !get_cached_folder_relative_path(parent_index, built,
+                sizeof(built) / sizeof(built[0])))
+        {
+            entry->relative_path_state = 0;
+            return 0;
+        }
+        if (entry->component == 0
+            || !append_path_part(built,
+                sizeof(built) / sizeof(built[0]), entry->component))
+        {
+            entry->relative_path_state = 0;
+            return 0;
+        }
+    }
+    chars = (unsigned int)wcslen(built) + 1;
+    entry->relative_path = wide_arena_alloc(&g_remote_name_arena, chars);
+    if (entry->relative_path == 0) {
+        entry->relative_path_state = 0;
+        return 0;
+    }
+    memcpy(entry->relative_path, built, chars * sizeof(WCHAR));
+    entry->relative_path_state = 2;
+    if (chars > path_size) {
+        return 0;
+    }
+    memcpy(path, built, chars * sizeof(WCHAR));
+    return 1;
+}
+
+static int
 build_node_relative_path(int node_index, WCHAR *path, unsigned int path_size)
 {
-    mega_node_info chain[64];
+    int chain_indices[128];
     mega_node_info node;
     int count;
     int i;
@@ -1580,15 +2410,39 @@ build_node_relative_path(int node_index, WCHAR *path, unsigned int path_size)
         return 0;
     }
 
+    if (node.type == 1
+        && get_cached_folder_relative_path(node_index, path, path_size))
+    {
+        return path[0] != L'\0';
+    }
+    if (node.type == 0) {
+        int parent_index;
+        WCHAR name[128];
+
+        parent_index = mega_api_find_node_by_handle(node.parent);
+        path[0] = L'\0';
+        if (parent_index >= 0
+            && !get_cached_folder_relative_path(parent_index, path, path_size))
+        {
+            path[0] = L'\0';
+        } else if (node_name_to_local_component(node_index, name,
+            sizeof(name) / sizeof(name[0]))
+            && append_path_part(path, path_size, name))
+        {
+            return 1;
+        }
+    }
+
     count = 0;
     guard = 0;
     while (guard++ < 128 && node.type != 2 && node.handle[0] != '\0') {
-        if (count >= (int)(sizeof(chain) / sizeof(chain[0]))) {
+        if (count >= (int)(sizeof(chain_indices) / sizeof(chain_indices[0]))) {
             return 0;
         }
-        chain[count++] = node;
+        chain_indices[count++] = node_index;
         if (node.parent[0] == '\0'
-            || !mega_api_get_node(mega_api_find_node_by_handle(node.parent), &node))
+            || (node_index = mega_api_find_node_by_handle(node.parent)) < 0
+            || !mega_api_get_node(node_index, &node))
         {
             break;
         }
@@ -1597,7 +2451,11 @@ build_node_relative_path(int node_index, WCHAR *path, unsigned int path_size)
     for (i = count - 1; i >= 0; --i) {
         WCHAR name[128];
 
-        node_name_to_wide(&chain[i], name, sizeof(name) / sizeof(name[0]));
+        if (!node_name_to_local_component(chain_indices[i], name,
+            sizeof(name) / sizeof(name[0])))
+        {
+            return 0;
+        }
         if (!append_path_part(path, path_size, name)) {
             return 0;
         }
@@ -1644,6 +2502,112 @@ build_download_tree_plain_path(int node_index, WCHAR *path, unsigned int path_si
     return build_base_plain_path(downloads_path, node_index, path, path_size);
 }
 
+static void
+node_scope_cache_free(void)
+{
+    if (g_node_scope_cache != 0) {
+        LocalFree((HLOCAL)g_node_scope_cache);
+    }
+    g_node_scope_cache = 0;
+    g_node_scope_cache_count = 0;
+}
+
+static int
+node_scope_cache_mark_subtrees(const int *roots, int root_count)
+{
+    int *stack;
+    int stack_count;
+    int total;
+    int i;
+
+    total = g_node_scope_cache_count;
+    stack = (int *)LocalAlloc(LPTR, sizeof(int) * (unsigned int)total);
+    if (stack == 0) {
+        return 0;
+    }
+    stack_count = 0;
+    for (i = 0; i < root_count; ++i) {
+        if (roots[i] >= 0 && roots[i] < total
+            && !g_node_scope_cache[roots[i]])
+        {
+            g_node_scope_cache[roots[i]] = 1;
+            stack[stack_count++] = roots[i];
+        }
+    }
+    while (stack_count > 0) {
+        int node_index;
+        int child_index;
+
+        node_index = stack[--stack_count];
+        child_index = mega_api_get_first_child_index(
+            g_remote_name_cache != 0
+                && node_index < g_remote_name_cache_count
+                ? g_remote_name_cache[node_index].handle : "");
+        if (child_index < 0) {
+            mega_node_info node;
+
+            if (mega_api_get_node(node_index, &node)) {
+                child_index = mega_api_get_first_child_index(node.handle);
+            }
+        }
+        while (child_index >= 0) {
+            if (child_index < total && !g_node_scope_cache[child_index]) {
+                g_node_scope_cache[child_index] = 1;
+                stack[stack_count++] = child_index;
+            }
+            child_index = mega_api_get_next_sibling_index(child_index);
+        }
+    }
+    LocalFree((HLOCAL)stack);
+    return 1;
+}
+
+static int
+node_scope_cache_build(void)
+{
+    int roots[MEGACE_MAX_SYNC_HANDLES];
+    int root_count;
+    int total;
+    int i;
+
+    node_scope_cache_free();
+    total = mega_api_get_node_count();
+    if (total <= 0) {
+        return 1;
+    }
+    g_node_scope_cache = (unsigned char *)LocalAlloc(LPTR,
+        (unsigned int)total);
+    if (g_node_scope_cache == 0) {
+        return 0;
+    }
+    g_node_scope_cache_count = total;
+
+    if ((g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC
+            && g_sync_handle_count <= 0)
+        || (g_download_mode == MEGACE_DOWNLOAD_MODE_MANUAL
+            && g_download_root_handle[0] == '\0'))
+    {
+        memset(g_node_scope_cache, 1, (unsigned int)total);
+        return 1;
+    }
+
+    root_count = 0;
+    if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
+        for (i = 0; i < g_sync_handle_count; ++i) {
+            roots[root_count++] = mega_api_find_node_by_handle(
+                g_sync_handles[i]);
+        }
+    } else {
+        roots[root_count++] = mega_api_find_node_by_handle(
+            g_download_root_handle);
+    }
+    if (!node_scope_cache_mark_subtrees(roots, root_count)) {
+        node_scope_cache_free();
+        return 0;
+    }
+    return 1;
+}
+
 static int
 node_matches_handle_or_descendant(int node_index, const char *root_handle)
 {
@@ -1678,6 +2642,11 @@ node_is_in_current_sync(int node_index)
 {
     int i;
 
+    if (g_node_scope_cache != 0
+        && node_index >= 0 && node_index < g_node_scope_cache_count)
+    {
+        return g_node_scope_cache[node_index] != 0;
+    }
     if (g_sync_handle_count <= 0) {
         return 1;
     }
@@ -1713,6 +2682,40 @@ wide_name_equals(const WCHAR *left, const WCHAR *right)
 }
 
 static int
+remote_name_cache_find(
+    const char *parent_handle,
+    const WCHAR *name,
+    int type
+)
+{
+    unsigned int slot;
+    unsigned int mask;
+
+    if (g_remote_name_slots == 0 || g_remote_name_slot_count <= 0) {
+        return -1;
+    }
+    mask = (unsigned int)g_remote_name_slot_count - 1;
+    slot = remote_name_hash(parent_handle, type, name) & mask;
+    for (;;) {
+        int node_index;
+        remote_name_cache_entry *entry;
+
+        node_index = g_remote_name_slots[slot];
+        if (node_index < 0) {
+            return -1;
+        }
+        entry = &g_remote_name_cache[node_index];
+        if (entry->type == type
+            && strcmp(entry->parent, parent_handle) == 0
+            && _wcsicmp(entry->component, name) == 0)
+        {
+            return node_index;
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+static int
 find_remote_child_by_wide_name(
     const char *parent_handle,
     const WCHAR *name,
@@ -1721,7 +2724,7 @@ find_remote_child_by_wide_name(
     int *found_index
 )
 {
-    int offset;
+    int child_index;
     mega_node_info child;
 
     if (found_index != 0) {
@@ -1733,24 +2736,57 @@ find_remote_child_by_wide_name(
         return 0;
     }
 
-    offset = 0;
-    while (mega_api_get_child_node(parent_handle, offset, &child)) {
+    child_index = remote_name_cache_find(parent_handle, name, type);
+    if (child_index >= 0 && mega_api_get_node(child_index, &child)
+        && child_index < g_remote_name_cache_count
+        && strcmp(child.handle,
+            g_remote_name_cache[child_index].handle) == 0)
+    {
+        if (found != 0) {
+            *found = child;
+        }
+        if (found_index != 0) {
+            *found_index = child_index;
+        }
+        return 1;
+    }
+
+    child_index = mega_api_get_first_child_index(parent_handle);
+    while (child_index >= 0 && mega_api_get_node(child_index, &child)) {
         WCHAR child_name[128];
 
         if (child.type == type) {
-            node_name_to_wide(&child, child_name,
-                sizeof(child_name) / sizeof(child_name[0]));
+            WCHAR raw_child_name[128];
+
+            if (!node_name_to_local_component(child_index, child_name,
+                sizeof(child_name) / sizeof(child_name[0])))
+            {
+                child_index = mega_api_get_next_sibling_index(child_index);
+                continue;
+            }
             if (wide_name_equals(child_name, name)) {
                 if (found != 0) {
                     *found = child;
                 }
                 if (found_index != 0) {
-                    *found_index = mega_api_find_node_by_handle(child.handle);
+                    *found_index = child_index;
+                }
+                return 1;
+            }
+            if (make_node_local_component(&child, raw_child_name,
+                sizeof(raw_child_name) / sizeof(raw_child_name[0]), 0)
+                && wide_name_equals(raw_child_name, name))
+            {
+                if (found != 0) {
+                    *found = child;
+                }
+                if (found_index != 0) {
+                    *found_index = child_index;
                 }
                 return 1;
             }
         }
-        offset++;
+        child_index = mega_api_get_next_sibling_index(child_index);
     }
     return 0;
 }
@@ -1770,7 +2806,318 @@ sync_should_skip_local_temp_file(const WCHAR *name)
     if (len >= 11 && _wcsicmp(name + len - 11, L".megaupload") == 0) {
         return 1;
     }
+    if (len >= 9 && _wcsicmp(name + len - 9, L".megapart") == 0) {
+        return 1;
+    }
+    if (len >= 11 && _wcsicmp(name + len - 11, L".megabackup") == 0) {
+        return 1;
+    }
     return 0;
+}
+
+static unsigned int
+local_snapshot_hash(const WCHAR *path)
+{
+    unsigned int hash;
+
+    hash = 2166136261UL;
+    while (path != 0 && *path != L'\0') {
+        WCHAR c;
+
+        c = *path++;
+        if (c >= L'A' && c <= L'Z') {
+            c = (WCHAR)(c - L'A' + L'a');
+        }
+        if (c == L'/') {
+            c = L'\\';
+        }
+        hash ^= (unsigned int)c;
+        hash *= 16777619UL;
+    }
+    return hash;
+}
+
+static void
+local_snapshot_free(void)
+{
+    if (g_local_snapshot != 0) {
+        LocalFree((HLOCAL)g_local_snapshot);
+    }
+    if (g_local_snapshot_slots != 0) {
+        LocalFree((HLOCAL)g_local_snapshot_slots);
+    }
+    wide_arena_free(&g_local_snapshot_arena);
+    g_local_snapshot = 0;
+    g_local_snapshot_count = 0;
+    g_local_snapshot_capacity = 0;
+    g_local_snapshot_slots = 0;
+    g_local_snapshot_slot_count = 0;
+}
+
+static int
+local_snapshot_ensure_capacity(int required)
+{
+    local_snapshot_entry *grown;
+    int capacity;
+
+    if (required <= g_local_snapshot_capacity) {
+        return 1;
+    }
+    capacity = g_local_snapshot_capacity == 0
+        ? 256 : g_local_snapshot_capacity;
+    while (capacity < required) {
+        if (capacity > 0x3fffffff) {
+            return 0;
+        }
+        capacity *= 2;
+    }
+    grown = (local_snapshot_entry *)LocalAlloc(LPTR,
+        sizeof(local_snapshot_entry) * (unsigned int)capacity);
+    if (grown == 0) {
+        return 0;
+    }
+    if (g_local_snapshot != 0) {
+        memcpy(grown, g_local_snapshot,
+            sizeof(local_snapshot_entry)
+                * (unsigned int)g_local_snapshot_count);
+        LocalFree((HLOCAL)g_local_snapshot);
+    }
+    g_local_snapshot = grown;
+    g_local_snapshot_capacity = capacity;
+    return 1;
+}
+
+static int
+local_snapshot_add(
+    const WCHAR *path,
+    int parent_index,
+    DWORD attributes,
+    unsigned __int64 size,
+    unsigned int mtime
+)
+{
+    local_snapshot_entry *entry;
+    unsigned int chars;
+    int index;
+
+    if (path == 0 || path[0] == L'\0'
+        || !local_snapshot_ensure_capacity(g_local_snapshot_count + 1))
+    {
+        return -1;
+    }
+    chars = (unsigned int)wcslen(path) + 1;
+    index = g_local_snapshot_count;
+    entry = &g_local_snapshot[index];
+    entry->path = wide_arena_alloc(&g_local_snapshot_arena, chars);
+    if (entry->path == 0) {
+        return -1;
+    }
+    memcpy(entry->path, path, chars * sizeof(WCHAR));
+    entry->parent_index = parent_index;
+    entry->first_child = -1;
+    entry->next_sibling = -1;
+    entry->attributes = attributes;
+    entry->size = size;
+    entry->mtime = mtime;
+    if (parent_index >= 0) {
+        entry->next_sibling = g_local_snapshot[parent_index].first_child;
+        g_local_snapshot[parent_index].first_child = index;
+    }
+    g_local_snapshot_count++;
+    return index;
+}
+
+static int
+local_snapshot_scan_directory(int parent_index)
+{
+    WCHAR search[MAX_PATH];
+    WIN32_FIND_DATA data;
+    HANDLE find;
+    const WCHAR *parent_path;
+
+    if (parent_index < 0 || parent_index >= g_local_snapshot_count) {
+        return 0;
+    }
+    parent_path = g_local_snapshot[parent_index].path;
+    if (wcslen(parent_path) + 3 > MAX_PATH) {
+        return 1;
+    }
+    _snwprintf(search, sizeof(search) / sizeof(search[0]), L"%s\\*",
+        parent_path);
+    search[(sizeof(search) / sizeof(search[0])) - 1] = L'\0';
+    find = FindFirstFile(search, &data);
+    if (find == INVALID_HANDLE_VALUE) {
+        return 1;
+    }
+
+    do {
+        WCHAR child_path[MAX_PATH];
+        unsigned __int64 size;
+        int child_index;
+
+        if (sync_cancel_callback(0)) {
+            FindClose(find);
+            return 0;
+        }
+        if (wcscmp(data.cFileName, L".") == 0
+            || wcscmp(data.cFileName, L"..") == 0
+            || sync_should_skip_local_temp_file(data.cFileName))
+        {
+            continue;
+        }
+        if (wcslen(parent_path) + wcslen(data.cFileName) + 2 > MAX_PATH) {
+            continue;
+        }
+        _snwprintf(child_path,
+            sizeof(child_path) / sizeof(child_path[0]), L"%s\\%s",
+            parent_path, data.cFileName);
+        child_path[(sizeof(child_path) / sizeof(child_path[0])) - 1] = L'\0';
+        size = (((unsigned __int64)data.nFileSizeHigh) << 32)
+            | (unsigned __int64)data.nFileSizeLow;
+        child_index = local_snapshot_add(child_path, parent_index,
+            data.dwFileAttributes, size,
+            filetime_to_unix_time(&data.ftLastWriteTime));
+        if (child_index < 0) {
+            FindClose(find);
+            return 0;
+        }
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+            && !local_snapshot_scan_directory(child_index))
+        {
+            FindClose(find);
+            return 0;
+        }
+    } while (FindNextFile(find, &data));
+    FindClose(find);
+    return 1;
+}
+
+static int
+local_snapshot_build(const WCHAR *root_path)
+{
+    int root_index;
+    int capacity;
+    int i;
+
+    local_snapshot_free();
+    root_index = local_snapshot_add(root_path, -1,
+        FILE_ATTRIBUTE_DIRECTORY, 0, 0);
+    if (root_index < 0 || !local_snapshot_scan_directory(root_index)) {
+        local_snapshot_free();
+        return 0;
+    }
+    capacity = 16;
+    while (capacity < g_local_snapshot_count * 2) {
+        capacity *= 2;
+    }
+    g_local_snapshot_slots = (int *)LocalAlloc(LPTR,
+        sizeof(int) * (unsigned int)capacity);
+    if (g_local_snapshot_slots == 0) {
+        local_snapshot_free();
+        return 0;
+    }
+    memset(g_local_snapshot_slots, 0xff,
+        sizeof(int) * (unsigned int)capacity);
+    g_local_snapshot_slot_count = capacity;
+    for (i = 0; i < g_local_snapshot_count; ++i) {
+        unsigned int slot;
+        unsigned int mask;
+
+        mask = (unsigned int)capacity - 1;
+        slot = local_snapshot_hash(g_local_snapshot[i].path) & mask;
+        while (g_local_snapshot_slots[slot] >= 0) {
+            slot = (slot + 1) & mask;
+        }
+        g_local_snapshot_slots[slot] = i;
+    }
+    return 1;
+}
+
+static int
+local_snapshot_find(const WCHAR *path)
+{
+    unsigned int slot;
+    unsigned int mask;
+
+    if (path == 0 || path[0] == L'\0' || g_local_snapshot_slots == 0
+        || g_local_snapshot_slot_count <= 0)
+    {
+        return -1;
+    }
+    mask = (unsigned int)g_local_snapshot_slot_count - 1;
+    slot = local_snapshot_hash(path) & mask;
+    for (;;) {
+        int index;
+
+        index = g_local_snapshot_slots[slot];
+        if (index < 0) {
+            return -1;
+        }
+        if (_wcsicmp(g_local_snapshot[index].path, path) == 0) {
+            return index;
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+static int
+local_snapshot_get_file_state(
+    const WCHAR *path,
+    unsigned __int64 *size,
+    unsigned int *mtime
+)
+{
+    int index;
+
+    index = local_snapshot_find(path);
+    if (index < 0
+        || (g_local_snapshot[index].attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        return get_local_file_state(path, size, mtime);
+    }
+    if (size != 0) {
+        *size = g_local_snapshot[index].size;
+    }
+    if (mtime != 0) {
+        *mtime = g_local_snapshot[index].mtime;
+    }
+    return 1;
+}
+
+static int
+local_snapshot_get_directory_state(
+    const WCHAR *path,
+    unsigned int *mtime
+)
+{
+    int index;
+
+    index = local_snapshot_find(path);
+    if (index < 0
+        || (g_local_snapshot[index].attributes
+            & FILE_ATTRIBUTE_DIRECTORY) == 0)
+    {
+        return get_local_directory_state(path, mtime);
+    }
+    if (mtime != 0) {
+        *mtime = g_local_snapshot[index].mtime;
+    }
+    return 1;
+}
+
+static const WCHAR *
+local_path_component(const WCHAR *path)
+{
+    const WCHAR *component;
+
+    component = path;
+    while (path != 0 && *path != L'\0') {
+        if (*path == L'\\' || *path == L'/') {
+            component = path + 1;
+        }
+        path++;
+    }
+    return component;
 }
 
 static int
@@ -1789,6 +3136,8 @@ find_local_folder_rename_candidate(
     WIN32_FIND_DATA data;
     int slash;
     int candidate_count;
+    int parent_index;
+    int child_index;
 
     if (old_path == 0 || old_path[0] == L'\0'
         || remote_parent == 0 || remote_parent[0] == '\0'
@@ -1811,6 +3160,44 @@ find_local_folder_rename_candidate(
         || !path_is_under_sync_directory(parent_path))
     {
         return 0;
+    }
+
+    parent_index = local_snapshot_find(parent_path);
+    if (parent_index >= 0
+        && (g_local_snapshot[parent_index].attributes
+            & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        candidate_count = 0;
+        child_index = g_local_snapshot[parent_index].first_child;
+        while (child_index >= 0) {
+            local_snapshot_entry *entry;
+            const WCHAR *child_name;
+            DWORD current_attributes;
+
+            entry = &g_local_snapshot[child_index];
+            child_index = entry->next_sibling;
+            child_name = local_path_component(entry->path);
+            current_attributes = GetFileAttributes(entry->path);
+            if (current_attributes == INVALID_FILE_ATTRIBUTES
+                || (current_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+                || sync_should_skip_local_temp_file(child_name)
+                || _wcsicmp(entry->path, old_path) == 0
+                || find_remote_child_by_wide_name(remote_parent, child_name,
+                    1, 0, 0))
+            {
+                continue;
+            }
+            candidate_count++;
+            if (candidate_count == 1) {
+                _snwprintf(new_path, new_path_size, L"%s", entry->path);
+                new_path[new_path_size - 1] = L'\0';
+                _snwprintf(new_name, new_name_size, L"%s", child_name);
+                new_name[new_name_size - 1] = L'\0';
+            } else {
+                break;
+            }
+        }
+        return candidate_count == 1;
     }
 
     _snwprintf(search, sizeof(search) / sizeof(search[0]), L"%s\\*",
@@ -1866,57 +3253,125 @@ sync_upload_local_tree(
     int *folders_created,
     int *uploaded,
     int *skipped,
-    int *failed
+    int *failed,
+    int files_seen,
+    int files_in_scope,
+    int downloaded,
+    int pending,
+    int conflicts
 )
 {
     WCHAR search[MAX_PATH];
     HANDLE find;
     WIN32_FIND_DATA data;
+    int snapshot_parent;
+    int snapshot_child;
+    int use_snapshot;
+    int live_first;
 
     if (parent_handle == 0 || parent_handle[0] == '\0'
         || local_dir == 0 || local_dir[0] == L'\0')
     {
         return;
     }
-
-    _snwprintf(search, sizeof(search) / sizeof(search[0]), L"%s\\*",
-        local_dir);
-    search[(sizeof(search) / sizeof(search[0])) - 1] = L'\0';
-    find = FindFirstFile(search, &data);
-    if (find == INVALID_HANDLE_VALUE) {
+    if (sync_cancel_callback(0)) {
         return;
     }
 
-    do {
+    snapshot_parent = local_snapshot_find(local_dir);
+    use_snapshot = snapshot_parent >= 0
+        && (g_local_snapshot[snapshot_parent].attributes
+            & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    snapshot_child = use_snapshot
+        ? g_local_snapshot[snapshot_parent].first_child : -1;
+    find = INVALID_HANDLE_VALUE;
+    live_first = 1;
+    if (!use_snapshot) {
+        _snwprintf(search, sizeof(search) / sizeof(search[0]), L"%s\\*",
+            local_dir);
+        search[(sizeof(search) / sizeof(search[0])) - 1] = L'\0';
+        find = FindFirstFile(search, &data);
+        if (find == INVALID_HANDLE_VALUE) {
+            return;
+        }
+    }
+
+    for (;;) {
         WCHAR child_path[MAX_PATH];
+        const WCHAR *child_name;
+        DWORD child_attributes;
 
-        if (wcscmp(data.cFileName, L".") == 0
-            || wcscmp(data.cFileName, L"..") == 0)
-        {
+        if (sync_cancel_callback(0)) {
+            break;
+        }
+
+        if (use_snapshot) {
+            local_snapshot_entry *entry;
+
+            if (snapshot_child < 0) {
+                break;
+            }
+            entry = &g_local_snapshot[snapshot_child];
+            snapshot_child = entry->next_sibling;
+            child_name = local_path_component(entry->path);
+            child_attributes = GetFileAttributes(entry->path);
+            if (child_attributes == INVALID_FILE_ATTRIBUTES) {
+                continue;
+            }
+            _snwprintf(child_path,
+                sizeof(child_path) / sizeof(child_path[0]), L"%s",
+                entry->path);
+            child_path[(sizeof(child_path)
+                / sizeof(child_path[0])) - 1] = L'\0';
+        } else {
+            if (!live_first && !FindNextFile(find, &data)) {
+                break;
+            }
+            live_first = 0;
+            child_name = data.cFileName;
+            child_attributes = data.dwFileAttributes;
+            if (wcscmp(child_name, L".") == 0
+                || wcscmp(child_name, L"..") == 0)
+            {
+                continue;
+            }
+            _snwprintf(child_path,
+                sizeof(child_path) / sizeof(child_path[0]), L"%s\\%s",
+                local_dir, child_name);
+            child_path[(sizeof(child_path)
+                / sizeof(child_path[0])) - 1] = L'\0';
+        }
+        if (sync_should_skip_local_temp_file(child_name)) {
             continue;
         }
-        if (sync_should_skip_local_temp_file(data.cFileName)) {
-            continue;
-        }
-        _snwprintf(child_path, sizeof(child_path) / sizeof(child_path[0]),
-            L"%s\\%s", local_dir, data.cFileName);
-        child_path[(sizeof(child_path) / sizeof(child_path[0])) - 1] = L'\0';
+        post_sync_details(child_name, 0, files_seen, files_in_scope,
+            downloaded, *uploaded, *folders_created, *skipped, pending,
+            conflicts, *failed, 0);
 
-        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        if ((child_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
             mega_node_info remote_folder;
+            sync_state_record *deleted_remote;
             char new_handle[16];
             char utf8_name[128];
             mega_api_result create_result;
 
-            if (find_remote_child_by_wide_name(parent_handle, data.cFileName,
+            if (find_remote_child_by_wide_name(parent_handle, child_name,
                 1, &remote_folder, 0))
             {
                 sync_upload_local_tree(remote_folder.handle, child_path,
-                    folders_created, uploaded, skipped, failed);
+                    folders_created, uploaded, skipped, failed,
+                    files_seen, files_in_scope, downloaded, pending,
+                    conflicts);
+                continue;
+            }
+            deleted_remote = sync_state_find_by_path(child_path);
+            if (deleted_remote != 0 && deleted_remote->handle[0] != '\0'
+                && mega_api_find_node_by_handle(deleted_remote->handle) < 0)
+            {
                 continue;
             }
 
-            if (!wide_to_utf8_or_acp(data.cFileName, utf8_name,
+            if (!wide_to_utf8_or_acp(child_name, utf8_name,
                 sizeof(utf8_name)))
             {
                 (*failed)++;
@@ -1925,6 +3380,9 @@ sync_upload_local_tree(
             memset(&create_result, 0, sizeof(create_result));
             new_handle[0] = '\0';
             post_sync_status(TEXT("Uploading folders"), 90);
+            post_sync_details(child_name, TEXT("Creating folder"),
+                files_seen, files_in_scope, downloaded, *uploaded,
+                *folders_created, *skipped, pending, conflicts, *failed, 1);
             if (mega_api_create_folder(parent_handle, utf8_name, new_handle,
                 sizeof(new_handle), &create_result))
             {
@@ -1946,7 +3404,9 @@ sync_upload_local_tree(
                 sync_state_upsert_folder(&created_folder, child_path);
                 (*folders_created)++;
                 sync_upload_local_tree(new_handle, child_path,
-                    folders_created, uploaded, skipped, failed);
+                    folders_created, uploaded, skipped, failed,
+                    files_seen, files_in_scope, downloaded, pending,
+                    conflicts);
             } else {
                 post_log_ascii(create_result.error[0] != '\0'
                     ? create_result.error
@@ -1955,6 +3415,7 @@ sync_upload_local_tree(
             }
         } else {
             mega_node_info existing_file;
+            sync_state_record *deleted_remote;
             WCHAR encrypted_path[MAX_PATH];
             char utf8_name[128];
             char new_handle[16];
@@ -1963,13 +3424,19 @@ sync_upload_local_tree(
             unsigned __int64 local_size;
             unsigned int local_mtime;
 
-            if (find_remote_child_by_wide_name(parent_handle, data.cFileName,
+            if (find_remote_child_by_wide_name(parent_handle, child_name,
                 0, &existing_file, 0))
             {
                 (*skipped)++;
                 continue;
             }
-            if (!wide_to_utf8_or_acp(data.cFileName, utf8_name,
+            deleted_remote = sync_state_find_by_path(child_path);
+            if (deleted_remote != 0 && deleted_remote->handle[0] != '\0'
+                && mega_api_find_node_by_handle(deleted_remote->handle) < 0)
+            {
+                continue;
+            }
+            if (!wide_to_utf8_or_acp(child_name, utf8_name,
                 sizeof(utf8_name)))
             {
                 (*failed)++;
@@ -1983,6 +3450,9 @@ sync_upload_local_tree(
             memset(&upload_result, 0, sizeof(upload_result));
             new_handle[0] = '\0';
             post_sync_status(TEXT("Uploading files"), 90);
+            post_sync_details(child_name, TEXT("Uploading"), files_seen,
+                files_in_scope, downloaded, *uploaded, *folders_created,
+                *skipped, pending, conflicts, *failed, 1);
             if (mega_api_upload_file_update("", parent_handle, utf8_name,
                 child_path, encrypted_path, new_handle, sizeof(new_handle),
                 &upload_result))
@@ -2018,14 +3488,21 @@ sync_upload_local_tree(
                 (*failed)++;
             }
         }
-    } while (FindNextFile(find, &data));
+    }
 
-    FindClose(find);
+    if (find != INVALID_HANDLE_VALUE) {
+        FindClose(find);
+    }
 }
 
 static int
 node_is_in_download_root(int node_index)
 {
+    if (g_node_scope_cache != 0
+        && node_index >= 0 && node_index < g_node_scope_cache_count)
+    {
+        return g_node_scope_cache[node_index] != 0;
+    }
     if (g_download_root_handle[0] == '\0') {
         return 1;
     }
@@ -2067,11 +3544,16 @@ add_node_to_current_sync(int node_index)
 }
 
 static void
-sync_add_conflict(const mega_node_info *node, const WCHAR *path, const WCHAR *name)
+sync_add_conflict(
+    int kind,
+    const mega_node_info *node,
+    const WCHAR *path,
+    const WCHAR *name
+)
 {
     sync_conflict_entry *entry;
 
-    if (node == 0 || path == 0 || name == 0) {
+    if (path == 0 || name == 0) {
         return;
     }
     if (g_sync_conflict_count >= MEGACE_MAX_SYNC_CONFLICTS) {
@@ -2079,13 +3561,36 @@ sync_add_conflict(const mega_node_info *node, const WCHAR *path, const WCHAR *na
     }
     entry = &g_sync_conflicts[g_sync_conflict_count++];
     memset(entry, 0, sizeof(*entry));
-    entry->node = *node;
+    entry->kind = kind;
+    if (node != 0) {
+        entry->node = *node;
+    }
     _snwprintf(entry->path, sizeof(entry->path) / sizeof(entry->path[0]),
         L"%s", path);
     entry->path[(sizeof(entry->path) / sizeof(entry->path[0])) - 1] = L'\0';
     _snwprintf(entry->name, sizeof(entry->name) / sizeof(entry->name[0]),
         L"%s", name);
     entry->name[(sizeof(entry->name) / sizeof(entry->name[0])) - 1] = L'\0';
+}
+
+static int
+sync_node_is_blocked_by_folder_conflict(int node_index)
+{
+    int i;
+
+    if (g_sync_folder_conflict_overflow) {
+        return 1;
+    }
+    for (i = 0; i < g_sync_conflict_count; ++i) {
+        if (g_sync_conflicts[i].kind == MEGACE_CONFLICT_LOCAL_FOLDER_DELETED
+            && g_sync_conflicts[i].node.handle[0] != '\0'
+            && node_matches_handle_or_descendant(node_index,
+                g_sync_conflicts[i].node.handle))
+        {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void
@@ -2190,9 +3695,206 @@ get_local_file_state(
     return 1;
 }
 
+static unsigned int
+sync_hash_bytes(const unsigned char *data, unsigned int bytes)
+{
+    unsigned int hash;
+    unsigned int i;
+
+    hash = 2166136261UL;
+    for (i = 0; i < bytes; ++i) {
+        hash ^= data[i];
+        hash *= 16777619UL;
+    }
+    return hash;
+}
+
+static int
+sync_state_set_path(sync_state_record *record, const WCHAR *path)
+{
+    WCHAR *copy;
+    unsigned int chars;
+
+    if (record == 0) {
+        return 0;
+    }
+    if (path == 0 || path[0] == L'\0') {
+        if (record->local_path != 0) {
+            LocalFree((HLOCAL)record->local_path);
+            record->local_path = 0;
+        }
+        return 1;
+    }
+    if (record->local_path != 0 && wcscmp(record->local_path, path) == 0) {
+        return 1;
+    }
+    chars = (unsigned int)wcslen(path) + 1;
+    if (chars > MAX_PATH) {
+        return 0;
+    }
+    copy = (WCHAR *)LocalAlloc(LPTR, chars * sizeof(WCHAR));
+    if (copy == 0) {
+        return 0;
+    }
+    memcpy(copy, path, chars * sizeof(WCHAR));
+    if (record->local_path != 0) {
+        LocalFree((HLOCAL)record->local_path);
+    }
+    record->local_path = copy;
+    return 1;
+}
+
+static unsigned int
+sync_handle_hash(const char *handle)
+{
+    return sync_hash_bytes((const unsigned char *)handle,
+        (unsigned int)strlen(handle));
+}
+
+static unsigned int
+sync_path_hash(const WCHAR *path)
+{
+    return sync_hash_bytes((const unsigned char *)path,
+        (unsigned int)(wcslen(path) * sizeof(WCHAR)));
+}
+
+static void
+sync_state_free_indexes(void)
+{
+    if (g_sync_handle_slots != 0) {
+        LocalFree((HLOCAL)g_sync_handle_slots);
+    }
+    if (g_sync_path_slots != 0) {
+        LocalFree((HLOCAL)g_sync_path_slots);
+    }
+    g_sync_handle_slots = 0;
+    g_sync_path_slots = 0;
+    g_sync_index_capacity = 0;
+    g_sync_handle_slots_used = 0;
+    g_sync_path_slots_used = 0;
+}
+
+static void
+sync_state_index_insert_handle(int record_index)
+{
+    unsigned int slot;
+    unsigned int mask;
+
+    if (g_sync_handle_slots == 0 || record_index < 0
+        || record_index >= g_sync_state_count
+        || g_sync_state_records[record_index].handle[0] == '\0')
+    {
+        return;
+    }
+    mask = (unsigned int)g_sync_index_capacity - 1;
+    slot = sync_handle_hash(g_sync_state_records[record_index].handle) & mask;
+    while (g_sync_handle_slots[slot] >= 0) {
+        if (g_sync_handle_slots[slot] == record_index) {
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    g_sync_handle_slots[slot] = record_index;
+    g_sync_handle_slots_used++;
+}
+
+static void
+sync_state_index_insert_path(int record_index)
+{
+    unsigned int slot;
+    unsigned int mask;
+
+    if (g_sync_path_slots == 0 || record_index < 0
+        || record_index >= g_sync_state_count
+        || g_sync_state_records[record_index].local_path == 0
+        || g_sync_state_records[record_index].local_path[0] == L'\0')
+    {
+        return;
+    }
+    mask = (unsigned int)g_sync_index_capacity - 1;
+    slot = sync_path_hash(g_sync_state_records[record_index].local_path) & mask;
+    while (g_sync_path_slots[slot] >= 0) {
+        if (g_sync_path_slots[slot] == record_index) {
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    g_sync_path_slots[slot] = record_index;
+    g_sync_path_slots_used++;
+}
+
+static int
+sync_state_rebuild_indexes(void)
+{
+    int capacity;
+    int *handle_slots;
+    int *path_slots;
+    int i;
+
+    sync_state_free_indexes();
+    if (g_sync_state_count <= 0) {
+        return 1;
+    }
+    capacity = 256;
+    while (capacity < g_sync_state_count * 2) {
+        if (capacity > 0x3fffffff) {
+            return 0;
+        }
+        capacity *= 2;
+    }
+    handle_slots = (int *)LocalAlloc(LPTR,
+        sizeof(int) * (unsigned int)capacity);
+    path_slots = (int *)LocalAlloc(LPTR,
+        sizeof(int) * (unsigned int)capacity);
+    if (handle_slots == 0 || path_slots == 0) {
+        if (handle_slots != 0) {
+            LocalFree((HLOCAL)handle_slots);
+        }
+        if (path_slots != 0) {
+            LocalFree((HLOCAL)path_slots);
+        }
+        return 0;
+    }
+    for (i = 0; i < capacity; ++i) {
+        handle_slots[i] = -1;
+        path_slots[i] = -1;
+    }
+    g_sync_handle_slots = handle_slots;
+    g_sync_path_slots = path_slots;
+    g_sync_index_capacity = capacity;
+    for (i = 0; i < g_sync_state_count; ++i) {
+        sync_state_index_insert_handle(i);
+        sync_state_index_insert_path(i);
+    }
+    return 1;
+}
+
+static void
+sync_state_index_record(int record_index)
+{
+    if (g_sync_index_capacity <= 0
+        || g_sync_state_count * 2 > g_sync_index_capacity
+        || g_sync_handle_slots_used * 4 >= g_sync_index_capacity * 3
+        || g_sync_path_slots_used * 4 >= g_sync_index_capacity * 3)
+    {
+        sync_state_rebuild_indexes();
+        return;
+    }
+    sync_state_index_insert_handle(record_index);
+    sync_state_index_insert_path(record_index);
+}
+
 static void
 sync_state_reset(void)
 {
+    int i;
+
+    for (i = 0; i < g_sync_state_count; ++i) {
+        if (g_sync_state_records[i].local_path != 0) {
+            LocalFree((HLOCAL)g_sync_state_records[i].local_path);
+        }
+    }
+    sync_state_free_indexes();
     if (g_sync_state_records != 0) {
         LocalFree((HLOCAL)g_sync_state_records);
     }
@@ -2241,6 +3943,23 @@ sync_state_find_by_handle(const char *handle)
     if (handle == 0 || handle[0] == '\0') {
         return 0;
     }
+    if (g_sync_handle_slots != 0 && g_sync_index_capacity > 0) {
+        unsigned int slot;
+        unsigned int mask;
+
+        mask = (unsigned int)g_sync_index_capacity - 1;
+        slot = sync_handle_hash(handle) & mask;
+        while (g_sync_handle_slots[slot] >= 0) {
+            i = g_sync_handle_slots[slot];
+            if (i < g_sync_state_count
+                && strcmp(g_sync_state_records[i].handle, handle) == 0)
+            {
+                return &g_sync_state_records[i];
+            }
+            slot = (slot + 1) & mask;
+        }
+        return 0;
+    }
     for (i = 0; i < g_sync_state_count; ++i) {
         if (strcmp(g_sync_state_records[i].handle, handle) == 0) {
             return &g_sync_state_records[i];
@@ -2257,8 +3976,27 @@ sync_state_find_by_path(const WCHAR *plain_path)
     if (plain_path == 0 || plain_path[0] == L'\0') {
         return 0;
     }
+    if (g_sync_path_slots != 0 && g_sync_index_capacity > 0) {
+        unsigned int slot;
+        unsigned int mask;
+
+        mask = (unsigned int)g_sync_index_capacity - 1;
+        slot = sync_path_hash(plain_path) & mask;
+        while (g_sync_path_slots[slot] >= 0) {
+            i = g_sync_path_slots[slot];
+            if (i < g_sync_state_count
+                && g_sync_state_records[i].local_path != 0
+                && _wcsicmp(g_sync_state_records[i].local_path,
+                    plain_path) == 0)
+            {
+                return &g_sync_state_records[i];
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
     for (i = 0; i < g_sync_state_count; ++i) {
-        if (g_sync_state_records[i].local_path[0] != L'\0'
+        if (g_sync_state_records[i].local_path != 0
+            && g_sync_state_records[i].local_path[0] != L'\0'
             && _wcsicmp(g_sync_state_records[i].local_path, plain_path) == 0)
         {
             return &g_sync_state_records[i];
@@ -2271,25 +4009,100 @@ static void
 sync_state_remove_by_handle(const char *handle)
 {
     int i;
+    sync_state_record *record;
 
     if (handle == 0 || handle[0] == '\0') {
         return;
     }
-    for (i = 0; i < g_sync_state_count; ++i) {
-        if (strcmp(g_sync_state_records[i].handle, handle) == 0) {
-            if (i + 1 < g_sync_state_count) {
-                memmove(&g_sync_state_records[i], &g_sync_state_records[i + 1],
-                    sizeof(sync_state_record)
-                    * (unsigned int)(g_sync_state_count - i - 1));
-            }
-            g_sync_state_count--;
-            if (g_sync_state_count >= 0) {
-                memset(&g_sync_state_records[g_sync_state_count], 0,
-                    sizeof(sync_state_record));
-            }
-            return;
+    record = sync_state_find_by_handle(handle);
+    if (record != 0) {
+        i = (int)(record - g_sync_state_records);
+        if (record->local_path != 0) {
+            LocalFree((HLOCAL)record->local_path);
+            record->local_path = 0;
+        }
+        if (i + 1 < g_sync_state_count) {
+            memcpy(&g_sync_state_records[i],
+                &g_sync_state_records[g_sync_state_count - 1],
+                sizeof(sync_state_record));
+        }
+        g_sync_state_count--;
+        if (g_sync_state_count >= 0) {
+            memset(&g_sync_state_records[g_sync_state_count], 0,
+                sizeof(sync_state_record));
+        }
+        if (g_sync_defer_index_rebuild) {
+            sync_state_free_indexes();
+        } else {
+            sync_state_rebuild_indexes();
         }
     }
+}
+
+static int
+sync_path_is_same_or_child(const WCHAR *path, const WCHAR *root)
+{
+    unsigned int root_len;
+
+    if (path == 0 || root == 0 || path[0] == L'\0' || root[0] == L'\0') {
+        return 0;
+    }
+    root_len = (unsigned int)wcslen(root);
+    if (_wcsnicmp(path, root, root_len) != 0) {
+        return 0;
+    }
+    return path[root_len] == L'\0'
+        || path[root_len] == L'\\'
+        || path[root_len] == L'/';
+}
+
+static void
+sync_state_remove_path_tree(const WCHAR *root)
+{
+    int i;
+
+    g_sync_defer_index_rebuild = 1;
+    i = 0;
+    while (i < g_sync_state_count) {
+        sync_state_record *record;
+
+        record = &g_sync_state_records[i];
+        if (record->local_path != 0
+            && sync_path_is_same_or_child(record->local_path, root))
+        {
+            if (record->local_path != 0) {
+                LocalFree((HLOCAL)record->local_path);
+                record->local_path = 0;
+            }
+            if (i + 1 < g_sync_state_count) {
+                memcpy(record, &g_sync_state_records[g_sync_state_count - 1],
+                    sizeof(*record));
+            }
+            g_sync_state_count--;
+            memset(&g_sync_state_records[g_sync_state_count], 0,
+                sizeof(sync_state_record));
+            continue;
+        }
+        i++;
+    }
+    g_sync_defer_index_rebuild = 0;
+    sync_state_rebuild_indexes();
+}
+
+static int
+sync_path_is_covered_by_remote_folder_conflict(const WCHAR *path)
+{
+    int i;
+
+    for (i = 0; i < g_sync_conflict_count; ++i) {
+        if (g_sync_conflicts[i].kind
+                == MEGACE_CONFLICT_REMOTE_FOLDER_DELETED
+            && sync_path_is_same_or_child(path, g_sync_conflicts[i].path))
+        {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int
@@ -2298,6 +4111,7 @@ sync_state_upsert_pending_local(const WCHAR *plain_path)
     sync_state_record *record;
     unsigned __int64 local_size;
     unsigned int local_mtime;
+    int added;
 
     if (plain_path == 0 || plain_path[0] == L'\0') {
         return 0;
@@ -2306,6 +4120,7 @@ sync_state_upsert_pending_local(const WCHAR *plain_path)
         return 0;
     }
 
+    added = 0;
     record = sync_state_find_by_path(plain_path);
     if (record == 0) {
         if (!sync_state_ensure_capacity(g_sync_state_count + 1)) {
@@ -2313,33 +4128,39 @@ sync_state_upsert_pending_local(const WCHAR *plain_path)
         }
         record = &g_sync_state_records[g_sync_state_count++];
         memset(record, 0, sizeof(*record));
+        added = 1;
+    }
+    if (!sync_state_set_path(record, plain_path)) {
+        if (added) {
+            g_sync_state_count--;
+            memset(record, 0, sizeof(*record));
+        }
+        return 0;
     }
     record->remote_size = local_size;
     record->remote_mtime = local_mtime;
     record->local_size = local_size;
     record->local_mtime = local_mtime;
     record->type = 0;
-    _snwprintf(record->local_path,
-        sizeof(record->local_path) / sizeof(record->local_path[0]),
-        L"%s", plain_path);
-    record->local_path[
-        (sizeof(record->local_path) / sizeof(record->local_path[0])) - 1] = L'\0';
+    sync_state_index_record((int)(record - g_sync_state_records));
     return 1;
 }
 
 static int
-sync_state_upsert_folder(const mega_node_info *node, const WCHAR *plain_path)
+sync_state_upsert_folder_known(
+    const mega_node_info *node,
+    const WCHAR *plain_path,
+    unsigned int local_mtime
+)
 {
     sync_state_record *record;
-    unsigned int local_mtime;
+    int added;
 
     if (node == 0 || node->handle[0] == '\0' || plain_path == 0) {
         return 0;
     }
-    if (!get_local_directory_state(plain_path, &local_mtime)) {
-        return 0;
-    }
 
+    added = 0;
     record = sync_state_find_by_handle(node->handle);
     if (record == 0) {
         record = sync_state_find_by_path(plain_path);
@@ -2350,6 +4171,14 @@ sync_state_upsert_folder(const mega_node_info *node, const WCHAR *plain_path)
         }
         record = &g_sync_state_records[g_sync_state_count++];
         memset(record, 0, sizeof(*record));
+        added = 1;
+    }
+    if (!sync_state_set_path(record, plain_path)) {
+        if (added) {
+            g_sync_state_count--;
+            memset(record, 0, sizeof(*record));
+        }
+        return 0;
     }
 
     _snprintf(record->handle, sizeof(record->handle), "%s", node->handle);
@@ -2359,28 +4188,37 @@ sync_state_upsert_folder(const mega_node_info *node, const WCHAR *plain_path)
     record->local_size = 0;
     record->local_mtime = local_mtime;
     record->type = node->type;
-    _snwprintf(record->local_path,
-        sizeof(record->local_path) / sizeof(record->local_path[0]),
-        L"%s", plain_path);
-    record->local_path[
-        (sizeof(record->local_path) / sizeof(record->local_path[0])) - 1] = L'\0';
+    sync_state_index_record((int)(record - g_sync_state_records));
     return 1;
 }
 
 static int
-sync_state_upsert_file(const mega_node_info *node, const WCHAR *plain_path)
+sync_state_upsert_folder(const mega_node_info *node, const WCHAR *plain_path)
+{
+    unsigned int local_mtime;
+
+    if (!get_local_directory_state(plain_path, &local_mtime)) {
+        return 0;
+    }
+    return sync_state_upsert_folder_known(node, plain_path, local_mtime);
+}
+
+static int
+sync_state_upsert_file_known(
+    const mega_node_info *node,
+    const WCHAR *plain_path,
+    unsigned __int64 local_size,
+    unsigned int local_mtime
+)
 {
     sync_state_record *record;
-    unsigned __int64 local_size;
-    unsigned int local_mtime;
+    int added;
 
     if (node == 0 || node->handle[0] == '\0' || plain_path == 0) {
         return 0;
     }
-    if (!get_local_file_state(plain_path, &local_size, &local_mtime)) {
-        return 0;
-    }
 
+    added = 0;
     record = sync_state_find_by_handle(node->handle);
     if (record == 0) {
         record = sync_state_find_by_path(plain_path);
@@ -2391,6 +4229,14 @@ sync_state_upsert_file(const mega_node_info *node, const WCHAR *plain_path)
         }
         record = &g_sync_state_records[g_sync_state_count++];
         memset(record, 0, sizeof(*record));
+        added = 1;
+    }
+    if (!sync_state_set_path(record, plain_path)) {
+        if (added) {
+            g_sync_state_count--;
+            memset(record, 0, sizeof(*record));
+        }
+        return 0;
     }
     _snprintf(record->handle, sizeof(record->handle), "%s", node->handle);
     record->handle[sizeof(record->handle) - 1] = '\0';
@@ -2400,12 +4246,21 @@ sync_state_upsert_file(const mega_node_info *node, const WCHAR *plain_path)
     record->local_size = local_size;
     record->local_mtime = local_mtime;
     record->type = node->type;
-    _snwprintf(record->local_path,
-        sizeof(record->local_path) / sizeof(record->local_path[0]),
-        L"%s", plain_path);
-    record->local_path[
-        (sizeof(record->local_path) / sizeof(record->local_path[0])) - 1] = L'\0';
+    sync_state_index_record((int)(record - g_sync_state_records));
     return 1;
+}
+
+static int
+sync_state_upsert_file(const mega_node_info *node, const WCHAR *plain_path)
+{
+    unsigned __int64 local_size;
+    unsigned int local_mtime;
+
+    if (!get_local_file_state(plain_path, &local_size, &local_mtime)) {
+        return 0;
+    }
+    return sync_state_upsert_file_known(node, plain_path,
+        local_size, local_mtime);
 }
 
 static int
@@ -2417,14 +4272,130 @@ sync_times_differ(unsigned int a, unsigned int b)
     return diff > 2;
 }
 
+static int
+sync_buffered_io_init(sync_buffered_io *io, HANDLE file)
+{
+    if (io == 0 || file == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    memset(io, 0, sizeof(*io));
+    io->buffer = (unsigned char *)LocalAlloc(LPTR,
+        MEGACE_SYNC_IO_BUFFER_SIZE);
+    if (io->buffer == 0) {
+        return 0;
+    }
+    io->file = file;
+    return 1;
+}
+
+static void
+sync_buffered_io_free(sync_buffered_io *io)
+{
+    if (io != 0 && io->buffer != 0) {
+        LocalFree((HLOCAL)io->buffer);
+        io->buffer = 0;
+    }
+}
+
+static int
+sync_buffered_read(sync_buffered_io *io, void *data, unsigned int bytes)
+{
+    unsigned char *out;
+
+    if (io == 0 || io->buffer == 0 || data == 0) {
+        return 0;
+    }
+    out = (unsigned char *)data;
+    while (bytes > 0) {
+        unsigned int available;
+        unsigned int copy_bytes;
+
+        if (io->position >= io->used) {
+            DWORD read_bytes;
+
+            read_bytes = 0;
+            if (!ReadFile(io->file, io->buffer,
+                MEGACE_SYNC_IO_BUFFER_SIZE, &read_bytes, 0)
+                || read_bytes == 0)
+            {
+                return 0;
+            }
+            io->position = 0;
+            io->used = read_bytes;
+        }
+        available = io->used - io->position;
+        copy_bytes = bytes < available ? bytes : available;
+        memcpy(out, io->buffer + io->position, copy_bytes);
+        out += copy_bytes;
+        io->position += copy_bytes;
+        bytes -= copy_bytes;
+    }
+    return 1;
+}
+
+static int
+sync_buffered_write_flush(sync_buffered_io *io)
+{
+    DWORD written;
+
+    if (io == 0 || io->buffer == 0) {
+        return 0;
+    }
+    if (io->used == 0) {
+        return 1;
+    }
+    written = 0;
+    if (!WriteFile(io->file, io->buffer, io->used, &written, 0)
+        || written != io->used)
+    {
+        return 0;
+    }
+    io->used = 0;
+    return 1;
+}
+
+static int
+sync_buffered_write(sync_buffered_io *io, const void *data, unsigned int bytes)
+{
+    const unsigned char *input;
+
+    if (io == 0 || io->buffer == 0 || data == 0) {
+        return 0;
+    }
+    input = (const unsigned char *)data;
+    while (bytes > 0) {
+        unsigned int space;
+        unsigned int copy_bytes;
+
+        space = MEGACE_SYNC_IO_BUFFER_SIZE - io->used;
+        if (space == 0) {
+            if (!sync_buffered_write_flush(io)) {
+                return 0;
+            }
+            space = MEGACE_SYNC_IO_BUFFER_SIZE;
+        }
+        copy_bytes = bytes < space ? bytes : space;
+        memcpy(io->buffer + io->used, input, copy_bytes);
+        io->used += copy_bytes;
+        input += copy_bytes;
+        bytes -= copy_bytes;
+    }
+    return 1;
+}
+
 static void
 sync_state_load(void)
 {
     WCHAR path[MAX_PATH];
+    WCHAR backup_path[MAX_PATH];
     HANDLE file;
+    sync_buffered_io reader;
     sync_state_header header;
-    DWORD read_bytes;
-    unsigned int bytes_to_read;
+    DWORD file_size_high;
+    DWORD file_size_low;
+    unsigned __int64 remaining_bytes;
+    unsigned int i;
+    int ok;
 
     sync_state_reset();
     if (!build_app_file_path(L"syncstate.dat", path,
@@ -2433,90 +4404,198 @@ sync_state_load(void)
         return;
     }
 
+    _snwprintf(backup_path,
+        sizeof(backup_path) / sizeof(backup_path[0]),
+        L"%s.megabackup", path);
+    backup_path[(sizeof(backup_path) / sizeof(backup_path[0])) - 1] = L'\0';
+    if (GetFileAttributes(path) == INVALID_FILE_ATTRIBUTES
+        && GetFileAttributes(backup_path) != INVALID_FILE_ATTRIBUTES)
+    {
+        MoveFile(backup_path, path);
+    }
+
     file = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL, 0);
     if (file == INVALID_HANDLE_VALUE) {
         return;
     }
+    if (!sync_buffered_io_init(&reader, file)) {
+        CloseHandle(file);
+        return;
+    }
 
     memset(&header, 0, sizeof(header));
-    if (!ReadFile(file, &header, sizeof(header), &read_bytes, 0)
-        || read_bytes != sizeof(header)
+    if (!sync_buffered_read(&reader, &header, sizeof(header))
         || memcmp(header.magic, MEGACE_SYNC_STATE_MAGIC, 7) != 0
-        || header.version != MEGACE_SYNC_STATE_VERSION
+        || (header.version != 1
+            && header.version != MEGACE_SYNC_STATE_VERSION)
         || header.count > 100000)
     {
+        sync_buffered_io_free(&reader);
         CloseHandle(file);
         sync_state_reset();
         return;
     }
 
-    if (header.count > 0 && sync_state_ensure_capacity((int)header.count)) {
-        bytes_to_read = sizeof(sync_state_record) * header.count;
-        if (ReadFile(file, g_sync_state_records, bytes_to_read, &read_bytes, 0)
-            && read_bytes == bytes_to_read)
-        {
-            g_sync_state_count = (int)header.count;
-        } else {
-            unsigned int old_bytes_to_read;
-            sync_state_record_v1 *old_records;
+    if (header.count > 0
+        && !sync_state_ensure_capacity((int)header.count))
+    {
+        sync_buffered_io_free(&reader);
+        CloseHandle(file);
+        sync_state_reset();
+        return;
+    }
 
-            SetFilePointer(file, sizeof(header), 0, FILE_BEGIN);
-            old_bytes_to_read = sizeof(sync_state_record_v1) * header.count;
-            old_records = (sync_state_record_v1 *)LocalAlloc(LPTR,
-                old_bytes_to_read);
-            if (old_records != 0
-                && ReadFile(file, old_records, old_bytes_to_read,
-                    &read_bytes, 0)
-                && read_bytes == old_bytes_to_read)
+    ok = 1;
+    if (header.version == MEGACE_SYNC_STATE_VERSION) {
+        for (i = 0; i < header.count && ok; ++i) {
+            sync_state_record_v2_disk disk;
+            sync_state_record *record;
+            WCHAR path_buffer[MAX_PATH];
+            DWORD path_bytes;
+
+            memset(&disk, 0, sizeof(disk));
+            if (!sync_buffered_read(&reader, &disk, sizeof(disk))
+                || disk.path_chars >= MAX_PATH)
             {
-                unsigned int i;
-
-                for (i = 0; i < header.count; ++i) {
-                    memcpy(g_sync_state_records[i].handle,
-                        old_records[i].handle,
-                        sizeof(g_sync_state_records[i].handle));
-                    g_sync_state_records[i].remote_size =
-                        old_records[i].remote_size;
-                    g_sync_state_records[i].remote_mtime =
-                        old_records[i].remote_mtime;
-                    g_sync_state_records[i].local_size =
-                        old_records[i].local_size;
-                    g_sync_state_records[i].local_mtime =
-                        old_records[i].local_mtime;
-                    g_sync_state_records[i].type = old_records[i].type;
-                }
-                g_sync_state_count = (int)header.count;
-            } else {
-                sync_state_reset();
+                ok = 0;
+                break;
             }
-            if (old_records != 0) {
-                LocalFree((HLOCAL)old_records);
+            record = &g_sync_state_records[g_sync_state_count++];
+            memset(record, 0, sizeof(*record));
+            memcpy(record->handle, disk.handle, sizeof(record->handle));
+            record->handle[sizeof(record->handle) - 1] = '\0';
+            record->remote_size = disk.remote_size;
+            record->remote_mtime = disk.remote_mtime;
+            record->local_size = disk.local_size;
+            record->local_mtime = disk.local_mtime;
+            record->type = disk.type;
+            if (disk.path_chars > 0) {
+                path_bytes = disk.path_chars * sizeof(WCHAR);
+                if (!sync_buffered_read(&reader, path_buffer, path_bytes))
+                {
+                    ok = 0;
+                    break;
+                }
+                path_buffer[disk.path_chars] = L'\0';
+                if (!sync_state_set_path(record, path_buffer)) {
+                    ok = 0;
+                }
+            }
+        }
+    } else {
+        file_size_high = 0;
+        file_size_low = GetFileSize(file, &file_size_high);
+        remaining_bytes = (((unsigned __int64)file_size_high) << 32)
+            | (unsigned __int64)file_size_low;
+        if (remaining_bytes >= sizeof(header)) {
+            remaining_bytes -= sizeof(header);
+        } else {
+            remaining_bytes = 0;
+        }
+        for (i = 0; i < header.count && ok; ++i) {
+            sync_state_record *record;
+
+            record = &g_sync_state_records[g_sync_state_count++];
+            memset(record, 0, sizeof(*record));
+            if (remaining_bytes
+                == (unsigned __int64)sizeof(sync_state_record_v1_with_path)
+                    * header.count)
+            {
+                sync_state_record_v1_with_path old_record;
+
+                if (!sync_buffered_read(&reader, &old_record,
+                    sizeof(old_record)))
+                {
+                    ok = 0;
+                    break;
+                }
+                memcpy(record->handle, old_record.handle,
+                    sizeof(record->handle));
+                record->handle[sizeof(record->handle) - 1] = '\0';
+                record->remote_size = old_record.remote_size;
+                record->remote_mtime = old_record.remote_mtime;
+                record->local_size = old_record.local_size;
+                record->local_mtime = old_record.local_mtime;
+                record->type = old_record.type;
+                old_record.local_path[MAX_PATH - 1] = L'\0';
+                if (!sync_state_set_path(record, old_record.local_path)) {
+                    ok = 0;
+                }
+            } else if (remaining_bytes
+                == (unsigned __int64)sizeof(sync_state_record_v1)
+                    * header.count)
+            {
+                sync_state_record_v1 old_record;
+
+                if (!sync_buffered_read(&reader, &old_record,
+                    sizeof(old_record)))
+                {
+                    ok = 0;
+                    break;
+                }
+                memcpy(record->handle, old_record.handle,
+                    sizeof(record->handle));
+                record->handle[sizeof(record->handle) - 1] = '\0';
+                record->remote_size = old_record.remote_size;
+                record->remote_mtime = old_record.remote_mtime;
+                record->local_size = old_record.local_size;
+                record->local_mtime = old_record.local_mtime;
+                record->type = old_record.type;
+            } else {
+                ok = 0;
             }
         }
     }
+    sync_buffered_io_free(&reader);
     CloseHandle(file);
+    if (!ok || g_sync_state_count != (int)header.count) {
+        sync_state_reset();
+        return;
+    }
+    sync_state_rebuild_indexes();
 }
 
-static void
+static int
 sync_state_save(void)
 {
     WCHAR path[MAX_PATH];
+    WCHAR temporary_path[MAX_PATH];
+    WCHAR backup_path[MAX_PATH];
     HANDLE file;
+    sync_buffered_io writer;
     sync_state_header header;
-    DWORD written;
-    unsigned int bytes_to_write;
+    int i;
+    int ok;
+    int had_original;
 
+    sync_state_rebuild_indexes();
     if (!build_app_file_path(L"syncstate.dat", path,
         sizeof(path) / sizeof(path[0])))
     {
-        return;
+        return 0;
     }
 
-    file = CreateFile(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
+    _snwprintf(temporary_path,
+        sizeof(temporary_path) / sizeof(temporary_path[0]),
+        L"%s.tmp", path);
+    temporary_path[(sizeof(temporary_path)
+        / sizeof(temporary_path[0])) - 1] = L'\0';
+    _snwprintf(backup_path,
+        sizeof(backup_path) / sizeof(backup_path[0]),
+        L"%s.megabackup", path);
+    backup_path[(sizeof(backup_path) / sizeof(backup_path[0])) - 1] = L'\0';
+    DeleteFile(temporary_path);
+
+    file = CreateFile(temporary_path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, 0);
     if (file == INVALID_HANDLE_VALUE) {
-        return;
+        return 0;
+    }
+    if (!sync_buffered_io_init(&writer, file)) {
+        CloseHandle(file);
+        DeleteFile(temporary_path);
+        return 0;
     }
 
     memset(&header, 0, sizeof(header));
@@ -2524,70 +4603,254 @@ sync_state_save(void)
     header.version = MEGACE_SYNC_STATE_VERSION;
     header.count = (unsigned int)g_sync_state_count;
 
-    WriteFile(file, &header, sizeof(header), &written, 0);
-    if (g_sync_state_count > 0) {
-        bytes_to_write = sizeof(sync_state_record)
-            * (unsigned int)g_sync_state_count;
-        WriteFile(file, g_sync_state_records, bytes_to_write, &written, 0);
+    if (!sync_buffered_write(&writer, &header, sizeof(header)))
+    {
+        sync_buffered_io_free(&writer);
+        CloseHandle(file);
+        DeleteFile(temporary_path);
+        return 0;
     }
+    ok = 1;
+    for (i = 0; i < g_sync_state_count; ++i) {
+        sync_state_record_v2_disk disk;
+        unsigned int path_bytes;
+
+        memset(&disk, 0, sizeof(disk));
+        memcpy(disk.handle, g_sync_state_records[i].handle,
+            sizeof(disk.handle));
+        disk.remote_size = g_sync_state_records[i].remote_size;
+        disk.remote_mtime = g_sync_state_records[i].remote_mtime;
+        disk.local_size = g_sync_state_records[i].local_size;
+        disk.local_mtime = g_sync_state_records[i].local_mtime;
+        disk.type = g_sync_state_records[i].type;
+        if (g_sync_state_records[i].local_path != 0) {
+            disk.path_chars = (unsigned int)wcslen(
+                g_sync_state_records[i].local_path);
+        }
+        if (!sync_buffered_write(&writer, &disk, sizeof(disk)))
+        {
+            ok = 0;
+            break;
+        }
+        path_bytes = disk.path_chars * sizeof(WCHAR);
+        if (path_bytes > 0
+            && !sync_buffered_write(&writer,
+                g_sync_state_records[i].local_path, path_bytes))
+        {
+            ok = 0;
+            break;
+        }
+    }
+    if (ok && !sync_buffered_write_flush(&writer)) {
+        ok = 0;
+    }
+    if (ok && !FlushFileBuffers(file)) {
+        ok = 0;
+    }
+    sync_buffered_io_free(&writer);
     CloseHandle(file);
+    if (!ok) {
+        DeleteFile(temporary_path);
+        return 0;
+    }
+
+    had_original = GetFileAttributes(path) != INVALID_FILE_ATTRIBUTES;
+    if (had_original
+        && GetFileAttributes(backup_path) != INVALID_FILE_ATTRIBUTES
+        && !DeleteFile(backup_path))
+    {
+        DeleteFile(temporary_path);
+        return 0;
+    }
+    if (had_original && !MoveFile(path, backup_path)) {
+        DeleteFile(temporary_path);
+        return 0;
+    }
+    if (!MoveFile(temporary_path, path)) {
+        if (had_original) {
+            MoveFile(backup_path, path);
+        }
+        DeleteFile(temporary_path);
+        return 0;
+    }
+    if (had_original) {
+        DeleteFile(backup_path);
+    }
+    return 1;
+}
+
+static int
+local_directory_is_empty(const WCHAR *path)
+{
+    WCHAR search[MAX_PATH];
+    WIN32_FIND_DATA data;
+    HANDLE find;
+    int empty;
+
+    _snwprintf(search, sizeof(search) / sizeof(search[0]), L"%s\\*", path);
+    search[(sizeof(search) / sizeof(search[0])) - 1] = L'\0';
+    find = FindFirstFile(search, &data);
+    if (find == INVALID_HANDLE_VALUE) {
+        return 1;
+    }
+    empty = 1;
+    do {
+        if (wcscmp(data.cFileName, L".") != 0
+            && wcscmp(data.cFileName, L"..") != 0)
+        {
+            empty = 0;
+            break;
+        }
+    } while (FindNextFile(find, &data));
+    FindClose(find);
+    return empty;
 }
 
 static void
-sync_reconcile_missing_remote_folders(int *skipped, int *failed)
+sync_reconcile_missing_remote_items(
+    int *skipped,
+    int *conflicts,
+    int *failed
+)
 {
     int i;
+    int removed;
 
-    i = 0;
-    while (i < g_sync_state_count) {
+    g_sync_defer_index_rebuild = 1;
+    do {
+        removed = 0;
+        i = 0;
+        while (i < g_sync_state_count) {
+            sync_state_record *record;
+
+            if (sync_cancel_callback(0)) {
+                goto done;
+            }
+
+            record = &g_sync_state_records[i];
+            if (record->type == 1
+                && record->handle[0] != '\0'
+                && mega_api_find_node_by_handle(record->handle) < 0)
+            {
+                if (record->local_path == 0
+                    || record->local_path[0] == L'\0'
+                    || !directory_exists(record->local_path))
+                {
+                    sync_state_remove_by_handle(record->handle);
+                    removed = 1;
+                    continue;
+                }
+                if (local_directory_is_empty(record->local_path)) {
+                    post_log_ascii("Deleting local folder removed from MEGA.");
+                    if (RemoveDirectory(record->local_path)) {
+                        if (skipped != 0) {
+                            (*skipped)++;
+                        }
+                        sync_state_remove_by_handle(record->handle);
+                        removed = 1;
+                        continue;
+                    }
+                    if (failed != 0) {
+                        (*failed)++;
+                    }
+                }
+            }
+            i++;
+        }
+    } while (removed);
+
+    for (i = 0; i < g_sync_state_count; ++i) {
         sync_state_record *record;
+
+        if (sync_cancel_callback(0)) {
+            goto done;
+        }
 
         record = &g_sync_state_records[i];
         if (record->type == 1
             && record->handle[0] != '\0'
+            && mega_api_find_node_by_handle(record->handle) < 0
+            && record->local_path != 0
+            && directory_exists(record->local_path)
+            && !local_directory_is_empty(record->local_path))
+        {
+            post_log_ascii("Conflict skipped, MEGA folder deleted but local folder is not empty.");
+            post_log_text(record->local_path);
+            if (g_sync_conflict_count >= MEGACE_MAX_SYNC_CONFLICTS) {
+                g_sync_remote_folder_conflict_overflow = 1;
+                post_log_ascii("Conflict list is full; missing MEGA files are deferred for safety.");
+            }
+            sync_add_conflict(MEGACE_CONFLICT_REMOTE_FOLDER_DELETED, 0,
+                record->local_path,
+                local_path_component(record->local_path));
+            if (conflicts != 0) {
+                (*conflicts)++;
+            }
+        }
+    }
+
+    i = 0;
+    while (i < g_sync_state_count) {
+        sync_state_record *record;
+        unsigned __int64 local_size;
+        unsigned int local_mtime;
+        int local_exists;
+
+        if (sync_cancel_callback(0)) {
+            goto done;
+        }
+
+        record = &g_sync_state_records[i];
+        if (record->type == 0
+            && record->handle[0] != '\0'
             && mega_api_find_node_by_handle(record->handle) < 0)
         {
-            if (record->local_path[0] != L'\0'
-                && directory_exists(record->local_path))
+            if (g_sync_remote_folder_conflict_overflow
+                || (record->local_path != 0
+                && sync_path_is_covered_by_remote_folder_conflict(
+                    record->local_path)))
             {
-                post_log_ascii("Deleting local folder removed from MEGA.");
-                if (delete_local_tree(record->local_path)) {
+                i++;
+                continue;
+            }
+            local_exists = record->local_path != 0
+                && record->local_path[0] != L'\0'
+                && local_snapshot_get_file_state(record->local_path, &local_size,
+                    &local_mtime);
+            if (!local_exists) {
+                sync_state_remove_by_handle(record->handle);
+                continue;
+            }
+            if (record->local_size == local_size
+                && !sync_times_differ(record->local_mtime, local_mtime))
+            {
+                post_log_ascii("Deleting local file removed from MEGA.");
+                if (DeleteFile(record->local_path)) {
                     if (skipped != 0) {
                         (*skipped)++;
                     }
+                    sync_state_remove_by_handle(record->handle);
+                    continue;
                 } else if (failed != 0) {
                     (*failed)++;
                 }
+            } else {
+                post_log_ascii("Conflict skipped, MEGA file deleted and local file changed.");
+                post_log_text(record->local_path);
+                sync_add_conflict(MEGACE_CONFLICT_REMOTE_FILE_DELETED, 0,
+                    record->local_path,
+                    local_path_component(record->local_path));
+                if (conflicts != 0) {
+                    (*conflicts)++;
+                }
             }
-            sync_state_remove_by_handle(record->handle);
-            continue;
         }
         i++;
     }
-}
 
-static int
-local_file_is_current(const WCHAR *path, const mega_node_info *node)
-{
-    HANDLE file;
-    FILETIME local_ft;
-    FILETIME mega_ft;
-    int cmp;
-
-    if (path == 0 || node == 0) {
-        return 0;
-    }
-    file = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL, 0);
-    if (file == INVALID_HANDLE_VALUE) {
-        return 0;
-    }
-    memset(&local_ft, 0, sizeof(local_ft));
-    GetFileTime(file, 0, 0, &local_ft);
-    CloseHandle(file);
-    unix_time_to_filetime(node->mtime, &mega_ft);
-    cmp = CompareFileTime(&local_ft, &mega_ft);
-    return cmp >= 0;
+done:
+    g_sync_defer_index_rebuild = 0;
+    sync_state_rebuild_indexes();
 }
 
 static void
@@ -2619,7 +4882,7 @@ build_download_file_path(
 {
     WCHAR downloads_path[MAX_PATH];
     WCHAR file_name[128];
-    const char *name;
+    int node_index;
 
     if (node == 0 || path == 0 || path_size == 0) {
         return 0;
@@ -2631,11 +4894,12 @@ build_download_file_path(
     downloads_path[(sizeof(downloads_path) / sizeof(downloads_path[0])) - 1] = L'\0';
     CreateDirectory(downloads_path, 0);
 
-    name = node->name[0] != '\0' ? node->name : node->handle;
-    MultiByteToWideChar(CP_ACP, 0, name, -1, file_name,
-        sizeof(file_name) / sizeof(file_name[0]));
-    file_name[(sizeof(file_name) / sizeof(file_name[0])) - 1] = L'\0';
-    sanitize_file_name(file_name);
+    node_index = mega_api_find_node_by_handle(node->handle);
+    if (node_index < 0 || !node_name_to_local_component(node_index,
+        file_name, sizeof(file_name) / sizeof(file_name[0])))
+    {
+        return 0;
+    }
 
     _snwprintf(path, path_size, encrypted
         ? L"%s\\%s.megaenc"
@@ -2656,103 +4920,270 @@ set_counter_be64(unsigned char *dst, unsigned __int64 value)
     }
 }
 
-static int
-decrypt_download_file(
-    const WCHAR *encrypted_path,
-    const WCHAR *plain_path,
-    const mega_node_info *node
-)
-{
-    HANDLE in_file;
-    HANDLE out_file;
-    unsigned char transfer_key[16];
+typedef struct download_decrypt_state {
+    mega_crypto_aes128_context transfer_context;
     unsigned char ctr[16];
-    unsigned char buffer[2048];
+    unsigned char stream[16];
+    unsigned char chunk_mac[16];
+    unsigned char fold_mac[16];
+    unsigned char mac_block[16];
+    unsigned char expected_meta_mac[8];
     unsigned __int64 block_index;
-    DWORD read_bytes;
-    int ok;
-    int i;
+    unsigned __int64 expected_size;
+    unsigned __int64 position;
+    unsigned long chunk_size;
+    unsigned long chunk_used;
+    unsigned int stream_used;
+    unsigned int mac_block_used;
+} download_decrypt_state;
 
-    if (encrypted_path == 0 || plain_path == 0 || node == 0
-        || !node->file_key_valid)
-    {
-        return 0;
-    }
+static int
+download_mac_encrypt_block(download_decrypt_state *state)
+{
+    unsigned int i;
 
     for (i = 0; i < 16; ++i) {
-        transfer_key[i] = (unsigned char)(node->file_key[i] ^ node->file_key[i + 16]);
+        state->chunk_mac[i] ^= state->mac_block[i];
     }
-    memcpy(ctr, node->file_key + 16, 8);
-    memset(ctr + 8, 0, 8);
-
-    in_file = CreateFile(encrypted_path, GENERIC_READ, FILE_SHARE_READ,
-        0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
-    if (in_file == INVALID_HANDLE_VALUE) {
-        mega_crypto_zero(transfer_key, sizeof(transfer_key));
-        mega_crypto_zero(ctr, sizeof(ctr));
-        return 0;
-    }
-
-    out_file = CreateFile(plain_path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL, 0);
-    if (out_file == INVALID_HANDLE_VALUE) {
-        CloseHandle(in_file);
-        mega_crypto_zero(transfer_key, sizeof(transfer_key));
-        mega_crypto_zero(ctr, sizeof(ctr));
-        return 0;
-    }
-
-    block_index = 0;
-    ok = 1;
-    while (ReadFile(in_file, buffer, sizeof(buffer), &read_bytes, 0)
-        && read_bytes > 0)
+    if (!mega_crypto_aes128_encrypt_context(&state->transfer_context,
+        state->chunk_mac))
     {
-        DWORD offset;
-        DWORD written;
+        return 0;
+    }
+    state->mac_block_used = 0;
+    memset(state->mac_block, 0, sizeof(state->mac_block));
+    return 1;
+}
 
-        offset = 0;
-        while (offset < read_bytes) {
-            unsigned char stream[16];
-            DWORD b;
-            DWORD available;
+static int
+download_mac_finish_chunk(download_decrypt_state *state)
+{
+    unsigned int i;
+    unsigned __int64 remaining;
 
-            memcpy(stream, ctr, 16);
-            set_counter_be64(stream + 8, block_index);
-            if (!mega_crypto_aes128_encrypt_block(transfer_key, stream)) {
-                ok = 0;
-                break;
-            }
-
-            available = read_bytes - offset;
-            if (available > 16) {
-                available = 16;
-            }
-            for (b = 0; b < available; ++b) {
-                buffer[offset + b] ^= stream[b];
-            }
-            offset += available;
-            block_index++;
-        }
-
-        if (!ok) {
-            break;
-        }
-
-        written = 0;
-        if (!WriteFile(out_file, buffer, read_bytes, &written, 0)
-            || written != read_bytes)
-        {
-            ok = 0;
-            break;
+    if (state->mac_block_used > 0) {
+        memset(state->mac_block + state->mac_block_used, 0,
+            sizeof(state->mac_block) - state->mac_block_used);
+        if (!download_mac_encrypt_block(state)) {
+            return 0;
         }
     }
+    for (i = 0; i < 16; ++i) {
+        state->fold_mac[i] ^= state->chunk_mac[i];
+    }
+    if (!mega_crypto_aes128_encrypt_context(&state->transfer_context,
+        state->fold_mac))
+    {
+        return 0;
+    }
 
-    CloseHandle(out_file);
-    CloseHandle(in_file);
-    mega_crypto_zero(transfer_key, sizeof(transfer_key));
-    mega_crypto_zero(ctr, sizeof(ctr));
-    mega_crypto_zero(buffer, sizeof(buffer));
-    return ok;
+    if (state->chunk_size < MEGACE_MAC_CHUNK_MAX) {
+        state->chunk_size += MEGACE_MAC_CHUNK_BASE;
+        if (state->chunk_size > MEGACE_MAC_CHUNK_MAX) {
+            state->chunk_size = MEGACE_MAC_CHUNK_MAX;
+        }
+    }
+    remaining = state->expected_size - state->position;
+    if (remaining < (unsigned __int64)state->chunk_size) {
+        state->chunk_size = (unsigned long)remaining;
+    }
+    state->chunk_used = 0;
+    memcpy(state->chunk_mac, state->ctr, 8);
+    memcpy(state->chunk_mac + 8, state->ctr, 8);
+    return 1;
+}
+
+static int
+download_mac_update(
+    download_decrypt_state *state,
+    const unsigned char *data,
+    unsigned int data_len
+)
+{
+    unsigned int offset;
+
+    if (state->position + data_len < state->position
+        || state->position + data_len > state->expected_size)
+    {
+        return 0;
+    }
+    offset = 0;
+    while (offset < data_len) {
+        unsigned int available;
+        unsigned long chunk_remaining;
+
+        chunk_remaining = state->chunk_size - state->chunk_used;
+        available = data_len - offset;
+        if (available > sizeof(state->mac_block) - state->mac_block_used) {
+            available = sizeof(state->mac_block) - state->mac_block_used;
+        }
+        if (available > chunk_remaining) {
+            available = (unsigned int)chunk_remaining;
+        }
+        memcpy(state->mac_block + state->mac_block_used, data + offset,
+            available);
+        state->mac_block_used += available;
+        state->chunk_used += available;
+        state->position += available;
+        offset += available;
+
+        if (state->mac_block_used == sizeof(state->mac_block)
+            && !download_mac_encrypt_block(state))
+        {
+            return 0;
+        }
+        if (state->chunk_used == state->chunk_size
+            && !download_mac_finish_chunk(state))
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int
+download_mac_is_valid(const download_decrypt_state *state)
+{
+    unsigned char meta[8];
+    unsigned char diff;
+    unsigned int i;
+
+    if (state->position != state->expected_size
+        || state->mac_block_used != 0 || state->chunk_used != 0)
+    {
+        return 0;
+    }
+    for (i = 0; i < 4; ++i) {
+        meta[i] = (unsigned char)(state->fold_mac[i]
+            ^ state->fold_mac[i + 4]);
+        meta[i + 4] = (unsigned char)(state->fold_mac[i + 8]
+            ^ state->fold_mac[i + 12]);
+    }
+    diff = 0;
+    for (i = 0; i < sizeof(meta); ++i) {
+        diff |= (unsigned char)(meta[i] ^ state->expected_meta_mac[i]);
+    }
+    mega_crypto_zero(meta, sizeof(meta));
+    return diff == 0;
+}
+
+static int
+decrypt_download_data(
+    unsigned char *data,
+    unsigned int data_len,
+    void *user_data
+)
+{
+    download_decrypt_state *state;
+    unsigned int offset;
+
+    state = (download_decrypt_state *)user_data;
+    if (data == 0 || state == 0) {
+        return 0;
+    }
+    offset = 0;
+    while (offset < data_len) {
+        unsigned int available;
+        unsigned int i;
+
+        if (state->stream_used >= sizeof(state->stream)
+            && data_len - offset >= 16)
+        {
+            unsigned char streams[128];
+            unsigned int block_count;
+            unsigned int block;
+            unsigned int bulk_bytes;
+
+            block_count = (data_len - offset) / 16;
+            if (block_count > 8) {
+                block_count = 8;
+            }
+            for (block = 0; block < block_count; ++block) {
+                memcpy(streams + block * 16, state->ctr, 8);
+                set_counter_be64(streams + block * 16 + 8,
+                    state->block_index++);
+            }
+            if (!mega_crypto_aes128_encrypt_blocks(
+                &state->transfer_context, streams, block_count))
+            {
+                mega_crypto_zero(streams, sizeof(streams));
+                return 0;
+            }
+            bulk_bytes = block_count * 16;
+            for (i = 0; i < bulk_bytes; ++i) {
+                data[offset + i] ^= streams[i];
+            }
+            mega_crypto_zero(streams, sizeof(streams));
+            offset += bulk_bytes;
+            continue;
+        }
+        if (state->stream_used >= sizeof(state->stream)) {
+            memcpy(state->stream, state->ctr, sizeof(state->stream));
+            set_counter_be64(state->stream + 8, state->block_index++);
+            if (!mega_crypto_aes128_encrypt_context(
+                &state->transfer_context, state->stream))
+            {
+                return 0;
+            }
+            state->stream_used = 0;
+        }
+        available = data_len - offset;
+        if (available > sizeof(state->stream) - state->stream_used) {
+            available = sizeof(state->stream) - state->stream_used;
+        }
+        for (i = 0; i < available; ++i) {
+            data[offset + i] ^= state->stream[state->stream_used + i];
+        }
+        state->stream_used += available;
+        offset += available;
+    }
+    return download_mac_update(state, data, data_len);
+}
+
+static int
+replace_download_file(const WCHAR *partial_path, const WCHAR *plain_path)
+{
+    WCHAR backup_path[MAX_PATH];
+    int destination_exists;
+
+    if (wcslen(plain_path) + 12 >= MAX_PATH) {
+        return 0;
+    }
+    _snwprintf(backup_path,
+        sizeof(backup_path) / sizeof(backup_path[0]),
+        L"%s.megabackup", plain_path);
+    backup_path[(sizeof(backup_path) / sizeof(backup_path[0])) - 1] = L'\0';
+
+    destination_exists = GetFileAttributes(plain_path)
+        != INVALID_FILE_ATTRIBUTES;
+    if (destination_exists
+        && GetFileAttributes(backup_path) != INVALID_FILE_ATTRIBUTES)
+    {
+        if (!DeleteFile(backup_path)) {
+            return 0;
+        }
+    } else if (!destination_exists
+        && GetFileAttributes(backup_path) != INVALID_FILE_ATTRIBUTES)
+    {
+        if (!MoveFile(backup_path, plain_path)) {
+            return 0;
+        }
+        destination_exists = 1;
+    }
+
+    if (destination_exists && !MoveFile(plain_path, backup_path)) {
+        return 0;
+    }
+    if (!MoveFile(partial_path, plain_path)) {
+        if (destination_exists) {
+            MoveFile(backup_path, plain_path);
+        }
+        return 0;
+    }
+    if (destination_exists) {
+        DeleteFile(backup_path);
+    }
+    return 1;
 }
 
 static int
@@ -2766,7 +5197,12 @@ download_node_to_plain_path(
     mega_http_result http_result;
     char url[2048];
     WCHAR encrypted_path[MAX_PATH];
+    WCHAR partial_path[MAX_PATH];
+    download_decrypt_state decrypt_state;
+    unsigned char transfer_key[16];
     char line[256];
+    int i;
+    int downloaded;
 
     if (node == 0 || plain_path == 0 || plain_path[0] == L'\0') {
         post_log_ascii("Download failed: invalid destination.");
@@ -2792,21 +5228,59 @@ download_node_to_plain_path(
     _snwprintf(encrypted_path, sizeof(encrypted_path) / sizeof(encrypted_path[0]),
         L"%s.megaenc", plain_path);
     encrypted_path[(sizeof(encrypted_path) / sizeof(encrypted_path[0])) - 1] = L'\0';
+    _snwprintf(partial_path, sizeof(partial_path) / sizeof(partial_path[0]),
+        L"%s.megapart", plain_path);
+    partial_path[(sizeof(partial_path) / sizeof(partial_path[0])) - 1] = L'\0';
+    DeleteFile(partial_path);
 
-    if (!mega_http_download_url_to_file(url, encrypted_path, &http_result)) {
+    memset(&decrypt_state, 0, sizeof(decrypt_state));
+    for (i = 0; i < 16; ++i) {
+        transfer_key[i] = (unsigned char)(node->file_key[i]
+            ^ node->file_key[i + 16]);
+    }
+    memcpy(decrypt_state.ctr, node->file_key + 16, 8);
+    memset(decrypt_state.ctr + 8, 0, 8);
+    memcpy(decrypt_state.chunk_mac, node->file_key + 16, 8);
+    memcpy(decrypt_state.chunk_mac + 8, node->file_key + 16, 8);
+    memcpy(decrypt_state.expected_meta_mac, node->file_key + 24, 8);
+    decrypt_state.expected_size = node->size;
+    decrypt_state.chunk_size = node->size < MEGACE_MAC_CHUNK_BASE
+        ? (unsigned long)node->size : MEGACE_MAC_CHUNK_BASE;
+    decrypt_state.stream_used = sizeof(decrypt_state.stream);
+    if (!mega_crypto_aes128_init(&decrypt_state.transfer_context,
+        transfer_key))
+    {
+        mega_crypto_zero(transfer_key, sizeof(transfer_key));
+        mega_crypto_zero(&decrypt_state, sizeof(decrypt_state));
+        post_log_ascii("Download failed: could not initialize decryption.");
+        return 0;
+    }
+    mega_crypto_zero(transfer_key, sizeof(transfer_key));
+    downloaded = mega_http_download_url_to_file_ex(url, partial_path,
+        decrypt_download_data, &decrypt_state, &http_result);
+    if (downloaded && !download_mac_is_valid(&decrypt_state)) {
+        downloaded = 0;
+        _snprintf(http_result.error, sizeof(http_result.error),
+            "Download integrity check failed (size or MEGA MAC mismatch)");
+        http_result.error[sizeof(http_result.error) - 1] = '\0';
+    }
+    mega_crypto_zero(&decrypt_state, sizeof(decrypt_state));
+    if (!downloaded) {
+        DeleteFile(partial_path);
         post_log_ascii(http_result.error[0] != '\0'
             ? http_result.error
-            : "Encrypted download failed.");
+            : "Download or decryption failed.");
         return 0;
     }
 
-    _snprintf(line, sizeof(line), "Downloaded encrypted file: %d bytes",
+    _snprintf(line, sizeof(line), "Downloaded and decrypted file: %I64u bytes",
         http_result.body_bytes);
     line[sizeof(line) - 1] = '\0';
     post_log_ascii(line);
 
-    if (!decrypt_download_file(encrypted_path, plain_path, node)) {
-        post_log_ascii("Decrypt failed; encrypted .megaenc file was kept.");
+    if (!replace_download_file(partial_path, plain_path)) {
+        DeleteFile(partial_path);
+        post_log_ascii("Download failed: could not safely replace destination file.");
         return 0;
     }
 
@@ -2844,7 +5318,7 @@ download_file_thread(LPVOID param)
 
     post_log_ascii("Downloading encrypted file...");
     mega_http_set_progress_callback(http_progress_callback, 0);
-    if (download_node_to_plain_path(&node, plain_path, 0)) {
+    if (download_node_to_plain_path(&node, plain_path, 1)) {
         post_log_ascii("Decrypted file saved under Mega Downloads.");
     } else {
         post_log_ascii("Download failed.");
@@ -2895,10 +5369,21 @@ sync_thread(LPVOID param)
     int files_seen;
     int files_in_scope;
     int files_no_key;
+    int cancelled;
     char line[160];
+    DWORD sync_start_tick;
+    DWORD phase_tick;
 
     (void)param;
 
+    sync_start_tick = GetTickCount();
+    phase_tick = sync_start_tick;
+    g_sync_total_ms = 0;
+    g_sync_refresh_ms = 0;
+    g_sync_scan_ms = 0;
+    g_sync_remote_ms = 0;
+    g_sync_upload_ms = 0;
+    g_sync_state_ms = 0;
     downloaded = 0;
     uploaded = 0;
     folders_created = 0;
@@ -2909,14 +5394,22 @@ sync_thread(LPVOID param)
     files_seen = 0;
     files_in_scope = 0;
     files_no_key = 0;
+    cancelled = 0;
     g_sync_conflict_count = 0;
+    g_sync_folder_conflict_overflow = 0;
+    g_sync_remote_folder_conflict_overflow = 0;
     memset(g_sync_conflicts, 0, sizeof(g_sync_conflicts));
+    node_scope_cache_free();
+    local_snapshot_free();
 
     post_log_ascii(g_download_mode == MEGACE_DOWNLOAD_MODE_MANUAL
         ? "Starting selected download..."
         : "Starting two way sync...");
     if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
         post_sync_status(TEXT("Checking for changes"), 5);
+        post_sync_details(TEXT("Preparing sync"), 0, files_seen, files_in_scope,
+            downloaded, uploaded, folders_created, skipped, upload_pending,
+            conflicts, failed, 1);
     }
     if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
         if (g_sync_directory[0] == L'\0') {
@@ -2924,6 +5417,11 @@ sync_thread(LPVOID param)
         }
         if (!ensure_directory_tree(g_sync_directory)) {
             post_log_ascii("Sync failed: could not create sync directory.");
+            failed++;
+            post_sync_status(TEXT("Sync failed: local folder unavailable"), 100);
+            post_sync_details(TEXT("Could not create local sync folder"),
+                0, files_seen, files_in_scope, downloaded, uploaded,
+                folders_created, skipped, upload_pending, conflicts, failed, 1);
             PostMessage(g_main_window, WM_MEGACE_SYNC_DONE, 0, 0);
             return 0;
         }
@@ -2933,6 +5431,7 @@ sync_thread(LPVOID param)
         return 0;
     }
 
+    phase_tick = GetTickCount();
     if (build_app_file_path(L"fetch_nodes.tmp", fetch_nodes_path,
         sizeof(fetch_nodes_path) / sizeof(fetch_nodes_path[0])))
     {
@@ -2942,8 +5441,22 @@ sync_thread(LPVOID param)
             post_log_ascii(result.error[0] != '\0'
                 ? result.error
                 : "Sync failed: could not fetch MEGA nodes.");
+            if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
+                cancelled = sync_cancel_callback(0);
+                if (!cancelled) {
+                    failed++;
+                }
+                post_sync_status(cancelled
+                    ? TEXT("Sync cancelled")
+                    : TEXT("Sync failed while refreshing MEGA"), 100);
+                post_sync_details(TEXT("Could not refresh MEGA node list"),
+                    0, files_seen, files_in_scope, downloaded, uploaded,
+                    folders_created, skipped, upload_pending, conflicts,
+                    failed, 1);
+            }
             DeleteFile(fetch_nodes_path);
-            PostMessage(g_main_window, WM_MEGACE_SYNC_DONE, 0, 0);
+            PostMessage(g_main_window, WM_MEGACE_SYNC_DONE,
+                cancelled ? 1 : 0, 0);
             return 0;
         }
         DeleteFile(fetch_nodes_path);
@@ -2952,26 +5465,79 @@ sync_thread(LPVOID param)
             summary.file_count, summary.folder_count);
         line[sizeof(line) - 1] = '\0';
         post_log_ascii(line);
+        if (!remote_name_cache_build()) {
+            post_log_ascii("Remote filename index unavailable; using fallback lookup.");
+        }
+        if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
+            post_sync_details(TEXT("MEGA node list refreshed"), 0, files_seen,
+                files_in_scope, downloaded, uploaded, folders_created,
+                skipped, upload_pending, conflicts, failed, 1);
+        }
     } else {
         post_log_ascii("Sync failed: could not build node cache path.");
+        if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
+            failed++;
+            post_sync_status(TEXT("Sync failed before node refresh"), 100);
+            post_sync_details(TEXT("Could not create temporary node cache"),
+                0, files_seen, files_in_scope, downloaded, uploaded,
+                folders_created, skipped, upload_pending, conflicts,
+                failed, 1);
+        }
         PostMessage(g_main_window, WM_MEGACE_SYNC_DONE, 0, 0);
         return 0;
     }
 
     if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
+        g_sync_refresh_ms = (DWORD)(GetTickCount() - phase_tick);
+    }
+    phase_tick = GetTickCount();
+
+    if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
+        if (sync_cancel_callback(0)) {
+            post_sync_status(TEXT("Sync cancelled"), 100);
+            PostMessage(g_main_window, WM_MEGACE_SYNC_DONE, 1, 0);
+            return 0;
+        }
         sync_state_load();
-        sync_reconcile_missing_remote_folders(&skipped, &failed);
+        if (!sync_cancel_callback(0)) {
+            if (!local_snapshot_build(g_sync_directory)
+                && !sync_cancel_callback(0))
+            {
+                post_log_ascii("Local snapshot unavailable; using live filesystem lookup.");
+            }
+        }
+        sync_reconcile_missing_remote_items(&skipped, &conflicts, &failed);
         post_sync_status(TEXT("Checking local files"), 20);
     }
 
+    if (!node_scope_cache_build()) {
+        post_log_ascii("Node scope index unavailable; using fallback traversal.");
+    }
+
+    if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
+        g_sync_scan_ms = (DWORD)(GetTickCount() - phase_tick);
+    }
+    phase_tick = GetTickCount();
+
     mega_http_set_progress_callback(http_progress_callback, 0);
+    mega_http_set_transfer_progress_callback(
+        http_transfer_progress_callback, 0);
     total = mega_api_get_node_count();
     for (i = 0; i < total; ++i) {
         mega_node_info node;
         WCHAR folder_path[MAX_PATH];
+        WCHAR display_name[128];
         sync_state_record *previous_folder;
+        unsigned int folder_mtime;
         int folder_exists;
         int remote_changed;
+
+        if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC
+            && sync_cancel_callback(0))
+        {
+            cancelled = 1;
+            break;
+        }
 
         if (!mega_api_get_node(i, &node) || node.type != 1) {
             continue;
@@ -2986,6 +5552,11 @@ sync_thread(LPVOID param)
                 failed++;
                 continue;
             }
+            node_name_to_wide(&node, display_name,
+                sizeof(display_name) / sizeof(display_name[0]));
+            post_sync_details(display_name, 0, files_seen, files_in_scope,
+                downloaded, uploaded, folders_created, skipped,
+                upload_pending, conflicts, failed, 0);
         } else {
             if (!node_is_in_download_root(i)) {
                 continue;
@@ -2998,7 +5569,9 @@ sync_thread(LPVOID param)
             }
         }
         previous_folder = 0;
-        folder_exists = directory_exists(folder_path);
+        folder_mtime = 0;
+        folder_exists = local_snapshot_get_directory_state(folder_path,
+            &folder_mtime);
         remote_changed = 0;
         if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
             previous_folder = sync_state_find_by_handle(node.handle);
@@ -3009,6 +5582,7 @@ sync_thread(LPVOID param)
                 remote_changed = sync_times_differ(
                     previous_folder->remote_mtime, node.mtime);
                 if (!folder_exists
+                    && previous_folder->local_path != 0
                     && previous_folder->local_path[0] != L'\0'
                     && directory_exists(previous_folder->local_path))
                 {
@@ -3047,6 +5621,7 @@ sync_thread(LPVOID param)
 
                             mega_api_rename_local_node(node.handle,
                                 rename_utf8);
+                            remote_name_cache_build();
                             renamed_node = node;
                             _snprintf(renamed_node.name,
                                 sizeof(renamed_node.name), "%s", rename_utf8);
@@ -3090,6 +5665,12 @@ sync_thread(LPVOID param)
                         sizeof(folder_name) / sizeof(folder_name[0]));
                     post_log_ascii("Conflict skipped, local folder deleted and MEGA changed:");
                     post_log_text(folder_name);
+                    if (g_sync_conflict_count >= MEGACE_MAX_SYNC_CONFLICTS) {
+                        g_sync_folder_conflict_overflow = 1;
+                        post_log_ascii("Conflict list is full; remaining files are deferred for safety.");
+                    }
+                    sync_add_conflict(MEGACE_CONFLICT_LOCAL_FOLDER_DELETED,
+                        &node, folder_path, folder_name);
                     skipped++;
                     conflicts++;
                     continue;
@@ -3098,7 +5679,12 @@ sync_thread(LPVOID param)
         }
         if (ensure_directory_tree(folder_path)) {
             if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
-                sync_state_upsert_folder(&node, folder_path);
+                if (folder_exists && folder_mtime != 0) {
+                    sync_state_upsert_folder_known(&node, folder_path,
+                        folder_mtime);
+                } else {
+                    sync_state_upsert_folder(&node, folder_path);
+                }
             }
             folders_created++;
         } else {
@@ -3106,13 +5692,26 @@ sync_thread(LPVOID param)
         }
     }
 
-    for (i = 0; i < total; ++i) {
+    for (i = 0; !cancelled && i < total; ++i) {
         mega_node_info node;
         WCHAR plain_path[MAX_PATH];
         WCHAR name[128];
         int progress;
 
+        if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC
+            && sync_cancel_callback(0))
+        {
+            cancelled = 1;
+            break;
+        }
+
         if (!mega_api_get_node(i, &node) || node.type != 0) {
+            continue;
+        }
+        if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC
+            && sync_node_is_blocked_by_folder_conflict(i))
+        {
+            skipped++;
             continue;
         }
         if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC && total > 0) {
@@ -3139,24 +5738,34 @@ sync_thread(LPVOID param)
                 failed++;
                 continue;
             }
+            node_name_to_wide(&node, name,
+                sizeof(name) / sizeof(name[0]));
+            post_sync_details(name, 0, files_seen, files_in_scope, downloaded,
+                uploaded, folders_created, skipped, upload_pending,
+                conflicts, failed, 0);
 
-            local_exists = get_local_file_state(plain_path,
+            local_exists = local_snapshot_get_file_state(plain_path,
                 &local_size, &local_mtime);
             previous = sync_state_find_by_handle(node.handle);
             if (previous == 0 && local_exists) {
                 previous = sync_state_find_by_path(plain_path);
             }
             if (previous == 0) {
-                if (local_exists && local_size == node.size) {
-                    sync_state_upsert_file(&node, plain_path);
+                if (local_exists && local_size == node.size
+                    && !sync_times_differ(local_mtime, node.mtime))
+                {
+                    sync_state_upsert_file_known(&node, plain_path,
+                        local_size, local_mtime);
                     skipped++;
                     continue;
                 }
                 if (local_exists) {
                     node_name_to_wide(&node, name, sizeof(name) / sizeof(name[0]));
-                    post_log_ascii("No previous sync state; recording current local/MEGA pair:");
+                    post_log_ascii("Conflict skipped, first sync found different local and MEGA files:");
                     post_log_text(name);
-                    sync_state_upsert_file(&node, plain_path);
+                    sync_add_conflict(MEGACE_CONFLICT_FILE, &node,
+                        plain_path, name);
+                    conflicts++;
                     skipped++;
                     continue;
                 }
@@ -3166,9 +5775,12 @@ sync_thread(LPVOID param)
                 local_changed = local_exists
                     && (previous->local_size != local_size
                         || sync_times_differ(previous->local_mtime, local_mtime));
-                local_deleted = !local_exists && previous->local_path[0] != L'\0';
+                local_deleted = !local_exists
+                    && previous->local_path != 0
+                    && previous->local_path[0] != L'\0';
 
                 if (!remote_changed && !local_exists
+                    && previous->local_path != 0
                     && previous->local_path[0] != L'\0'
                     && get_local_file_state(previous->local_path,
                         &local_size, &local_mtime))
@@ -3180,7 +5792,8 @@ sync_thread(LPVOID param)
                             sizeof(name) / sizeof(name[0]));
                         post_log_ascii("Renamed local file to match MEGA:");
                         post_log_text(name);
-                        sync_state_upsert_file(&node, plain_path);
+                        sync_state_upsert_file_known(&node, plain_path,
+                            local_size, local_mtime);
                         skipped++;
                         continue;
                     }
@@ -3208,7 +5821,8 @@ sync_thread(LPVOID param)
                     node_name_to_wide(&node, name, sizeof(name) / sizeof(name[0]));
                     post_log_ascii("Conflict skipped, local deleted and MEGA changed:");
                     post_log_text(name);
-                    sync_add_conflict(&node, plain_path, name);
+                    sync_add_conflict(MEGACE_CONFLICT_FILE, &node,
+                        plain_path, name);
                     conflicts++;
                     skipped++;
                     continue;
@@ -3217,7 +5831,8 @@ sync_thread(LPVOID param)
                     node_name_to_wide(&node, name, sizeof(name) / sizeof(name[0]));
                     post_log_ascii("Conflict skipped, local and MEGA both changed:");
                     post_log_text(name);
-                    sync_add_conflict(&node, plain_path, name);
+                    sync_add_conflict(MEGACE_CONFLICT_FILE, &node,
+                        plain_path, name);
                     conflicts++;
                     skipped++;
                     continue;
@@ -3231,6 +5846,9 @@ sync_thread(LPVOID param)
                     post_log_ascii("Uploading local change:");
                     post_log_text(name);
                     post_sync_status(TEXT("Uploading files"), progress);
+                    post_sync_details(name, TEXT("Uploading"), files_seen,
+                        files_in_scope, downloaded, uploaded, folders_created,
+                        skipped, upload_pending, conflicts, failed, 1);
                     _snwprintf(encrypted_path,
                         sizeof(encrypted_path) / sizeof(encrypted_path[0]),
                         L"%s.megaupload", plain_path);
@@ -3257,6 +5875,10 @@ sync_thread(LPVOID param)
                         sync_state_upsert_file(&node, plain_path);
                         uploaded++;
                     } else {
+                        if (sync_cancel_callback(0)) {
+                            cancelled = 1;
+                            break;
+                        }
                         post_log_ascii(upload_result.error[0] != '\0'
                             ? upload_result.error
                             : "Upload failed.");
@@ -3266,16 +5888,11 @@ sync_thread(LPVOID param)
                     continue;
                 }
                 if (!remote_changed && local_exists) {
-                    sync_state_upsert_file(&node, plain_path);
+                    sync_state_upsert_file_known(&node, plain_path,
+                        local_size, local_mtime);
                     skipped++;
                     continue;
                 }
-            }
-
-            if (local_file_is_current(plain_path, &node) && previous == 0) {
-                sync_state_upsert_file(&node, plain_path);
-                skipped++;
-                continue;
             }
         } else {
             if (!node_is_in_download_root(i)) {
@@ -3294,6 +5911,9 @@ sync_thread(LPVOID param)
         post_log_text(name);
         if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
             post_sync_status(TEXT("Downloading files"), progress);
+            post_sync_details(name, TEXT("Downloading"), files_seen,
+                files_in_scope, downloaded, uploaded, folders_created,
+                skipped, upload_pending, conflicts, failed, 1);
         }
         if (!node.file_key_valid) {
             files_no_key++;
@@ -3304,13 +5924,25 @@ sync_thread(LPVOID param)
             }
             downloaded++;
         } else {
+            if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC
+                && sync_cancel_callback(0))
+            {
+                cancelled = 1;
+                break;
+            }
             failed++;
         }
     }
-    mega_http_set_progress_callback(0, 0);
-
     if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
+        g_sync_remote_ms = (DWORD)(GetTickCount() - phase_tick);
+    }
+    phase_tick = GetTickCount();
+
+    if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC && !cancelled) {
         post_sync_status(TEXT("Uploading local-only files"), 90);
+        post_sync_details(TEXT("Scanning for local-only items"), 0, files_seen,
+            files_in_scope, downloaded, uploaded, folders_created, skipped,
+            upload_pending, conflicts, failed, 1);
         if (g_sync_handle_count <= 0) {
             int root_index;
             mega_node_info root;
@@ -3318,7 +5950,9 @@ sync_thread(LPVOID param)
             root_index = mega_api_find_root_node();
             if (root_index >= 0 && mega_api_get_node(root_index, &root)) {
                 sync_upload_local_tree(root.handle, g_sync_directory,
-                    &folders_created, &uploaded, &skipped, &failed);
+                    &folders_created, &uploaded, &skipped, &failed,
+                    files_seen, files_in_scope, downloaded, upload_pending,
+                    conflicts);
             }
         } else {
             int selected;
@@ -3327,6 +5961,11 @@ sync_thread(LPVOID param)
                 int node_index;
                 mega_node_info selected_node;
                 WCHAR selected_path[MAX_PATH];
+
+                if (sync_cancel_callback(0)) {
+                    cancelled = 1;
+                    break;
+                }
 
                 node_index = mega_api_find_node_by_handle(
                     g_sync_handles[selected]);
@@ -3342,15 +5981,45 @@ sync_thread(LPVOID param)
                     continue;
                 }
                 sync_upload_local_tree(selected_node.handle, selected_path,
-                    &folders_created, &uploaded, &skipped, &failed);
+                    &folders_created, &uploaded, &skipped, &failed,
+                    files_seen, files_in_scope, downloaded, upload_pending,
+                    conflicts);
             }
         }
-        sync_state_save();
-        if (g_sync_conflict_count > 0) {
+        if (sync_cancel_callback(0)) {
+            cancelled = 1;
+        }
+    }
+
+    mega_http_set_transfer_progress_callback(0, 0);
+    mega_http_set_progress_callback(0, 0);
+
+    if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
+        g_sync_upload_ms = (DWORD)(GetTickCount() - phase_tick);
+    }
+    phase_tick = GetTickCount();
+
+    if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
+        if (!sync_state_save()) {
+            post_log_ascii("Warning: could not save sync state safely.");
+            failed++;
+        }
+        g_sync_state_ms = (DWORD)(GetTickCount() - phase_tick);
+        g_sync_total_ms = (DWORD)(GetTickCount() - sync_start_tick);
+        if (cancelled) {
+            post_sync_status(TEXT("Sync cancelled"), 100);
+        } else if (conflicts > 0) {
             post_sync_status(TEXT("Sync complete; conflicts need review"), 100);
         } else {
             post_sync_status(TEXT("Sync complete"), 100);
         }
+        post_sync_details(cancelled
+                ? TEXT("Cancelled safely")
+                : conflicts > 0
+                ? TEXT("Complete - conflicts need review")
+                : TEXT("Complete"),
+            0, files_seen, files_in_scope, downloaded, uploaded,
+            folders_created, skipped, upload_pending, conflicts, failed, 1);
     }
 
     if (g_download_mode == MEGACE_DOWNLOAD_MODE_MANUAL) {
@@ -3360,14 +6029,31 @@ sync_thread(LPVOID param)
             downloaded, skipped, failed);
     } else {
         _snprintf(line, sizeof(line),
-            "Sync finished: folders=%d files=%d/%d no_key=%d downloaded=%d uploaded=%d skipped=%d upload_pending=%d conflicts=%d failed=%d",
+            cancelled
+            ? "Sync cancelled: folders=%d files=%d/%d no_key=%d downloaded=%d uploaded=%d skipped=%d upload_pending=%d conflicts=%d failed=%d"
+            : "Sync finished: folders=%d files=%d/%d no_key=%d downloaded=%d uploaded=%d skipped=%d upload_pending=%d conflicts=%d failed=%d",
             folders_created, files_in_scope, files_seen, files_no_key,
             downloaded, uploaded, skipped, upload_pending, conflicts, failed);
     }
     line[sizeof(line) - 1] = '\0';
     post_log_ascii(line);
+    if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC) {
+        _snprintf(line, sizeof(line),
+            "Sync timing: total=%lu ms refresh=%lu scan=%lu remote=%lu local-upload=%lu state=%lu",
+            (unsigned long)g_sync_total_ms,
+            (unsigned long)g_sync_refresh_ms,
+            (unsigned long)g_sync_scan_ms,
+            (unsigned long)g_sync_remote_ms,
+            (unsigned long)g_sync_upload_ms,
+            (unsigned long)g_sync_state_ms);
+        line[sizeof(line) - 1] = '\0';
+        post_log_ascii(line);
+    }
 
-    PostMessage(g_main_window, WM_MEGACE_SYNC_DONE, 0, 0);
+    node_scope_cache_free();
+    local_snapshot_free();
+    PostMessage(g_main_window, WM_MEGACE_SYNC_DONE,
+        cancelled ? 1 : 0, (LPARAM)conflicts);
     return 0;
 }
 
@@ -3385,6 +6071,8 @@ sync_conflict_resolution_thread(LPVOID param)
     post_sync_status(TEXT("Resolving conflicts"), 0);
     sync_state_load();
     mega_http_set_progress_callback(http_progress_callback, 0);
+    mega_http_set_transfer_progress_callback(
+        http_transfer_progress_callback, 0);
     for (i = 0; i < g_sync_conflict_count; ++i) {
         sync_conflict_entry *entry;
         int progress;
@@ -3393,105 +6081,312 @@ sync_conflict_resolution_thread(LPVOID param)
         progress = g_sync_conflict_count > 0
             ? (i * 100) / g_sync_conflict_count
             : 0;
-        if (entry->choice == 1) {
-            WCHAR encrypted_path[MAX_PATH];
-            mega_api_result upload_result;
-            char new_handle[16];
+        post_sync_details(entry->name, 0, -1, -1, -1, -1, -1, -1,
+            -1, -1, -1, 1);
+        if (entry->choice == 3) {
+            entry->resolved = 1;
+            continue;
+        }
+        if (entry->choice == 1 || entry->choice == 2) {
+            int ok;
 
-            post_sync_status(TEXT("Uploading conflict file"), progress);
-            _snwprintf(encrypted_path,
-                sizeof(encrypted_path) / sizeof(encrypted_path[0]),
-                L"%s.megaupload", entry->path);
-            encrypted_path[(sizeof(encrypted_path)
-                / sizeof(encrypted_path[0])) - 1] = L'\0';
-            new_handle[0] = '\0';
-            memset(&upload_result, 0, sizeof(upload_result));
-            if (mega_api_upload_file_update(entry->node.handle,
-                entry->node.parent, entry->node.name, entry->path,
-                encrypted_path, new_handle, sizeof(new_handle), &upload_result))
-            {
-                if (new_handle[0] != '\0') {
-                    _snprintf(entry->node.handle, sizeof(entry->node.handle),
-                        "%s", new_handle);
-                    entry->node.handle[sizeof(entry->node.handle) - 1] = '\0';
+            ok = 0;
+            if (entry->kind == MEGACE_CONFLICT_REMOTE_FILE_DELETED) {
+                if (entry->choice == 1) {
+                    sync_state_remove_path_tree(entry->path);
+                    ok = 1;
+                } else if (!path_is_under_sync_directory(entry->path)) {
+                    post_log_ascii("Refused to delete conflict file outside the sync directory.");
+                } else if (GetFileAttributes(entry->path)
+                    == INVALID_FILE_ATTRIBUTES || DeleteFile(entry->path))
+                {
+                    sync_state_remove_path_tree(entry->path);
+                    ok = 1;
                 }
-                sync_state_upsert_file(&entry->node, entry->path);
-                resolved++;
+            } else if (entry->kind
+                == MEGACE_CONFLICT_REMOTE_FOLDER_DELETED)
+            {
+                if (entry->choice == 1) {
+                    sync_state_remove_path_tree(entry->path);
+                    ok = 1;
+                } else if (!directory_exists(entry->path)
+                    || delete_local_tree(entry->path))
+                {
+                    sync_state_remove_path_tree(entry->path);
+                    ok = 1;
+                }
+            } else if (entry->kind
+                == MEGACE_CONFLICT_LOCAL_FOLDER_DELETED)
+            {
+                if (entry->choice == 1) {
+                    mega_api_result delete_result;
+
+                    post_sync_status(TEXT("Deleting MEGA folder"), progress);
+                    memset(&delete_result, 0, sizeof(delete_result));
+                    if (mega_api_delete_node(entry->node.handle,
+                        &delete_result))
+                    {
+                        sync_state_remove_path_tree(entry->path);
+                        ok = 1;
+                    } else {
+                        post_log_ascii(delete_result.error[0] != '\0'
+                            ? delete_result.error
+                            : "Conflict folder delete failed.");
+                    }
+                } else if (ensure_directory_tree(entry->path)) {
+                    sync_state_remove_path_tree(entry->path);
+                    sync_state_upsert_folder(&entry->node, entry->path);
+                    ok = 1;
+                }
+            } else if (entry->choice == 1) {
+                DWORD attrs;
+
+                attrs = GetFileAttributes(entry->path);
+                if (attrs == INVALID_FILE_ATTRIBUTES) {
+                    mega_api_result delete_result;
+
+                    post_sync_status(TEXT("Deleting MEGA file"), progress);
+                    memset(&delete_result, 0, sizeof(delete_result));
+                    if (mega_api_delete_node(entry->node.handle,
+                        &delete_result))
+                    {
+                        sync_state_remove_path_tree(entry->path);
+                        ok = 1;
+                    } else {
+                        post_log_ascii(delete_result.error[0] != '\0'
+                            ? delete_result.error
+                            : "Conflict file delete failed.");
+                    }
+                } else {
+                    WCHAR encrypted_path[MAX_PATH];
+                    mega_api_result upload_result;
+                    char new_handle[16];
+
+                    post_sync_status(TEXT("Uploading conflict file"), progress);
+                    post_sync_details(entry->name, TEXT("Uploading"),
+                        -1, -1, -1, -1, -1, -1, -1, -1, -1, 1);
+                    _snwprintf(encrypted_path,
+                        sizeof(encrypted_path) / sizeof(encrypted_path[0]),
+                        L"%s.megaupload", entry->path);
+                    encrypted_path[(sizeof(encrypted_path)
+                        / sizeof(encrypted_path[0])) - 1] = L'\0';
+                    new_handle[0] = '\0';
+                    memset(&upload_result, 0, sizeof(upload_result));
+                    if (mega_api_upload_file_update(entry->node.handle,
+                        entry->node.parent, entry->node.name, entry->path,
+                        encrypted_path, new_handle, sizeof(new_handle),
+                        &upload_result))
+                    {
+                        if (new_handle[0] != '\0') {
+                            _snprintf(entry->node.handle,
+                                sizeof(entry->node.handle), "%s", new_handle);
+                            entry->node.handle[
+                                sizeof(entry->node.handle) - 1] = '\0';
+                        }
+                        sync_state_upsert_file(&entry->node, entry->path);
+                        ok = 1;
+                    } else {
+                        post_log_ascii(upload_result.error[0] != '\0'
+                            ? upload_result.error
+                            : "Conflict upload failed.");
+                    }
+                }
             } else {
-                post_log_ascii(upload_result.error[0] != '\0'
-                    ? upload_result.error
-                    : "Conflict upload failed.");
-                failed++;
+                post_sync_status(TEXT("Downloading conflict file"), progress);
+                post_sync_details(entry->name, TEXT("Downloading"),
+                    -1, -1, -1, -1, -1, -1, -1, -1, -1, 1);
+                if (download_node_to_plain_path(&entry->node,
+                    entry->path, 1))
+                {
+                    sync_state_upsert_file(&entry->node, entry->path);
+                    ok = 1;
+                }
             }
-        } else if (entry->choice == 2) {
-            post_sync_status(TEXT("Downloading conflict file"), progress);
-            if (download_node_to_plain_path(&entry->node, entry->path, 1)) {
-                sync_state_upsert_file(&entry->node, entry->path);
+            if (ok) {
+                entry->resolved = 1;
                 resolved++;
             } else {
+                entry->choice = 0;
                 failed++;
             }
         }
     }
+    mega_http_set_transfer_progress_callback(0, 0);
     mega_http_set_progress_callback(0, 0);
-    sync_state_save();
+    if (!sync_state_save()) {
+        post_log_ascii("Warning: could not save conflict-resolution state safely.");
+    }
     post_sync_status(failed == 0
         ? TEXT("Conflict resolution complete")
         : TEXT("Conflict resolution finished with errors"),
         100);
+    post_sync_details(failed == 0
+            ? TEXT("Conflict resolution complete")
+            : TEXT("Conflict resolution completed with errors"),
+        0, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1);
     PostMessage(g_main_window, WM_MEGACE_CONFLICT_DONE,
         (WPARAM)resolved, (LPARAM)failed);
     return 0;
 }
 
 static void
-ask_and_resolve_sync_conflicts(HWND hwnd)
+update_conflict_detail(void)
+{
+    int selection;
+    int index;
+    sync_conflict_entry *entry;
+    WCHAR detail[640];
+    const WCHAR *description;
+    const WCHAR *choice;
+
+    if (g_conflict_list == 0 || g_conflict_detail == 0) {
+        return;
+    }
+    selection = (int)SendMessage(g_conflict_list, LB_GETCURSEL, 0, 0);
+    if (selection == LB_ERR) {
+        SetWindowText(g_conflict_detail,
+            TEXT("No unresolved sync issues. Run Two Way Sync to check again."));
+        EnableWindow(g_conflict_keep_local, FALSE);
+        EnableWindow(g_conflict_keep_mega, FALSE);
+        EnableWindow(g_conflict_skip, FALSE);
+        return;
+    }
+    index = (int)SendMessage(g_conflict_list, LB_GETITEMDATA,
+        (WPARAM)selection, 0);
+    if (index < 0 || index >= g_sync_conflict_count) {
+        return;
+    }
+    entry = &g_sync_conflicts[index];
+    if (entry->kind == MEGACE_CONFLICT_REMOTE_FILE_DELETED) {
+        description = L"Deleted on MEGA, but changed locally. Keep Local restores it to MEGA on the next sync. Keep MEGA deletes the local file.";
+    } else if (entry->kind == MEGACE_CONFLICT_REMOTE_FOLDER_DELETED) {
+        description = L"Deleted on MEGA, but the local folder still contains items. Keep Local restores it on the next sync. Keep MEGA deletes the local folder and its contents.";
+    } else if (entry->kind == MEGACE_CONFLICT_LOCAL_FOLDER_DELETED) {
+        description = L"Deleted locally, but changed on MEGA. Keep Local deletes the MEGA folder. Keep MEGA recreates it locally; its contents are downloaded on the next sync.";
+    } else if (GetFileAttributes(entry->path) == INVALID_FILE_ATTRIBUTES) {
+        description = L"Deleted locally, but changed on MEGA. Keep Local deletes the MEGA file. Keep MEGA downloads it again.";
+    } else {
+        description = L"Changed both locally and on MEGA. Keep Local uploads the local file. Keep MEGA downloads and replaces the local file.";
+    }
+    choice = entry->choice == 1 ? L"Keep Local"
+        : entry->choice == 2 ? L"Keep MEGA"
+        : entry->choice == 3 ? L"Skip"
+        : L"Not chosen";
+    _snwprintf(detail, sizeof(detail) / sizeof(detail[0]),
+        L"%s\r\n\r\n%s\r\n\r\nChoice: %s", entry->path,
+        description, choice);
+    detail[(sizeof(detail) / sizeof(detail[0])) - 1] = L'\0';
+    SetWindowText(g_conflict_detail, detail);
+    EnableWindow(g_conflict_keep_local, TRUE);
+    EnableWindow(g_conflict_keep_mega, TRUE);
+    EnableWindow(g_conflict_skip, TRUE);
+}
+
+static void
+populate_conflict_list(void)
+{
+    int i;
+    int first;
+
+    if (g_conflict_list == 0) {
+        return;
+    }
+    SendMessage(g_conflict_list, LB_RESETCONTENT, 0, 0);
+    first = -1;
+    for (i = 0; i < g_sync_conflict_count; ++i) {
+        WCHAR label[192];
+        const WCHAR *choice;
+        int item;
+
+        if (g_sync_conflicts[i].resolved) {
+            continue;
+        }
+        choice = g_sync_conflicts[i].choice == 1 ? L"Local"
+            : g_sync_conflicts[i].choice == 2 ? L"MEGA"
+            : g_sync_conflicts[i].choice == 3 ? L"Skip"
+            : L"Choose";
+        _snwprintf(label, sizeof(label) / sizeof(label[0]), L"[%s] %s",
+            choice, g_sync_conflicts[i].name);
+        label[(sizeof(label) / sizeof(label[0])) - 1] = L'\0';
+        item = (int)SendMessage(g_conflict_list, LB_ADDSTRING, 0,
+            (LPARAM)label);
+        if (item != LB_ERR && item != LB_ERRSPACE) {
+            SendMessage(g_conflict_list, LB_SETITEMDATA, (WPARAM)item,
+                (LPARAM)i);
+            if (first < 0) {
+                first = item;
+            }
+        }
+    }
+    if (first >= 0) {
+        SendMessage(g_conflict_list, LB_SETCURSEL, (WPARAM)first, 0);
+    }
+    EnableWindow(g_conflict_apply, first >= 0);
+    update_conflict_detail();
+}
+
+static void
+set_selected_conflict_choice(int choice)
+{
+    int selection;
+    int index;
+
+    selection = (int)SendMessage(g_conflict_list, LB_GETCURSEL, 0, 0);
+    if (selection == LB_ERR) {
+        return;
+    }
+    index = (int)SendMessage(g_conflict_list, LB_GETITEMDATA,
+        (WPARAM)selection, 0);
+    if (index < 0 || index >= g_sync_conflict_count) {
+        return;
+    }
+    g_sync_conflicts[index].choice = choice;
+    populate_conflict_list();
+    if (selection < (int)SendMessage(g_conflict_list, LB_GETCOUNT, 0, 0)) {
+        SendMessage(g_conflict_list, LB_SETCURSEL, (WPARAM)selection, 0);
+        update_conflict_detail();
+    }
+}
+
+static void
+start_conflict_resolution(HWND hwnd)
 {
     int i;
     int choices;
     HANDLE thread_handle;
 
-    if (g_sync_conflict_count <= 0) {
-        return;
-    }
-
     choices = 0;
     for (i = 0; i < g_sync_conflict_count; ++i) {
-        WCHAR message[384];
-        int answer;
-
-        _snwprintf(message, sizeof(message) / sizeof(message[0]),
-            L"Sync conflict:\r\n%s\r\n\r\nYes: replace server with local file\r\nNo: replace local file with server file\r\nCancel: skip remaining conflicts",
-            g_sync_conflicts[i].name);
-        message[(sizeof(message) / sizeof(message[0])) - 1] = L'\0';
-        answer = MessageBox(hwnd, message, TEXT("Sync Conflict"),
-            MB_YESNOCANCEL | MB_ICONQUESTION);
-        if (answer == IDYES) {
-            g_sync_conflicts[i].choice = 1;
+        if (!g_sync_conflicts[i].resolved
+            && (g_sync_conflicts[i].choice == 1
+                || g_sync_conflicts[i].choice == 2
+                || g_sync_conflicts[i].choice == 3))
+        {
             choices++;
-        } else if (answer == IDNO) {
-            g_sync_conflicts[i].choice = 2;
-            choices++;
-        } else {
-            break;
         }
     }
-
     if (choices <= 0) {
-        post_sync_status(TEXT("Conflicts skipped"), 100);
+        MessageBox(hwnd, TEXT("Choose Keep Local, Keep MEGA, or Skip for at least one issue."),
+            TEXT("Sync Issues"), MB_OK | MB_ICONINFORMATION);
         return;
     }
     if (InterlockedCompareExchange(&g_probe_running, 1, 0) != 0) {
         append_log_text(TEXT("Cannot resolve conflicts: another operation is running."));
         return;
     }
+    InterlockedExchange(&g_sync_running, 1);
     thread_handle = CreateThread(0, 0, sync_conflict_resolution_thread,
         0, 0, 0);
     if (thread_handle == 0) {
+        InterlockedExchange(&g_sync_running, 0);
         InterlockedExchange(&g_probe_running, 0);
         append_log_text(TEXT("Could not start conflict resolver."));
         return;
     }
+    EnableWindow(g_conflict_keep_local, FALSE);
+    EnableWindow(g_conflict_keep_mega, FALSE);
+    EnableWindow(g_conflict_skip, FALSE);
+    EnableWindow(g_conflict_apply, FALSE);
     CloseHandle(thread_handle);
 }
 
@@ -3500,20 +6395,35 @@ start_one_way_sync(HWND hwnd)
 {
     HANDLE thread_handle;
 
+    if (InterlockedCompareExchange(&g_sync_running, 0, 0) != 0) {
+        set_view_mode(hwnd, MEGACE_VIEW_SYNC);
+        return;
+    }
     save_settings();
     if (InterlockedCompareExchange(&g_probe_running, 1, 0) != 0) {
         append_log_text(TEXT("Another MEGA operation is already running."));
         return;
     }
 
+    InterlockedExchange(&g_sync_running, 1);
     g_download_mode = MEGACE_DOWNLOAD_MODE_SYNC;
+    InterlockedExchange(&g_sync_cancel_requested, 0);
+    mega_http_set_cancel_callback(sync_cancel_callback, 0);
     g_download_root_index = -1;
     g_download_root_handle[0] = '\0';
     reset_sync_page(TEXT("Checking for changes"));
     set_view_mode(hwnd, MEGACE_VIEW_SYNC);
+    if (g_sync_cancel != 0) {
+        EnableWindow(g_sync_cancel, TRUE);
+    }
     thread_handle = CreateThread(0, 0, sync_thread, 0, 0, 0);
     if (thread_handle == 0) {
+        InterlockedExchange(&g_sync_running, 0);
         InterlockedExchange(&g_probe_running, 0);
+        mega_http_set_cancel_callback(0, 0);
+        if (g_sync_cancel != 0) {
+            EnableWindow(g_sync_cancel, FALSE);
+        }
         append_log_text(TEXT("Could not start sync thread."));
         return;
     }
@@ -3618,18 +6528,24 @@ server_operation_thread(LPVOID param)
                 g_server_op_parent, g_server_op_name))
             {
                 post_log_ascii("Local file list update failed after create.");
+            } else {
+                remote_name_cache_build();
             }
         } else if (g_server_op_type == MEGACE_SERVER_OP_RENAME
             && target_handle[0] != '\0')
         {
             if (!mega_api_rename_local_node(target_handle, g_server_op_name)) {
                 post_log_ascii("Local file list update failed after rename.");
+            } else {
+                remote_name_cache_build();
             }
         } else if (g_server_op_type == MEGACE_SERVER_OP_DELETE
             && target_handle[0] != '\0')
         {
             if (!mega_api_remove_local_node(target_handle)) {
                 post_log_ascii("Local file list update failed after delete.");
+            } else {
+                remote_name_cache_build();
             }
         }
     } else {
@@ -3778,7 +6694,7 @@ set_current_parent_from_root(void)
 static void
 populate_file_list(void)
 {
-    int child_offset;
+    int child_index;
     int node_count;
     mega_node_info child;
     file_sort_entry *entries;
@@ -3819,10 +6735,9 @@ populate_file_list(void)
     entries = 0;
     entry_count = 0;
     entry_capacity = 0;
-    child_offset = 0;
-    while (mega_api_get_child_node(g_current_parent, child_offset, &child)) {
+    child_index = mega_api_get_first_child_index(g_current_parent);
+    while (child_index >= 0 && mega_api_get_node(child_index, &child)) {
         file_sort_entry *grown;
-        int node_index;
 
         if (entry_count >= entry_capacity) {
             int new_capacity;
@@ -3841,13 +6756,12 @@ populate_file_list(void)
             entries = grown;
             entry_capacity = new_capacity;
         }
-        node_index = mega_api_find_node_by_handle(child.handle);
-        entries[entry_count].node_index = node_index;
+        entries[entry_count].node_index = child_index;
         entries[entry_count].node = child;
         format_node_name(&child, entries[entry_count].label,
             sizeof(entries[entry_count].label) / sizeof(entries[entry_count].label[0]));
         entry_count++;
-        child_offset++;
+        child_index = mega_api_get_next_sibling_index(child_index);
     }
 
     if (entry_count > 1) {
@@ -4104,6 +7018,33 @@ http_progress_callback(const char *message, void *user_data)
         return;
     }
     post_log_ascii(message);
+}
+
+static void
+http_transfer_progress_callback(
+    unsigned __int64 bytes_done,
+    unsigned __int64 bytes_total,
+    void *user_data
+)
+{
+    unsigned int percent;
+
+    (void)user_data;
+    if (g_main_window == 0) {
+        return;
+    }
+    if (bytes_total == 0) {
+        percent = 0;
+    } else if (bytes_done >= bytes_total) {
+        percent = 100;
+    } else {
+        percent = (unsigned int)((bytes_done * 100ULL) / bytes_total);
+        if (percent > 99) {
+            percent = 99;
+        }
+    }
+    PostMessage(g_main_window, WM_MEGACE_TRANSFER_PROGRESS,
+        (WPARAM)percent, 0);
 }
 
 static const char *
@@ -4452,9 +7393,9 @@ save_session_to_file(void)
     }
 
     if (mega_api_save_session_file(session_path)) {
-        post_log_text(TEXT("Saved session.dat beside the executable."));
+        post_log_text(TEXT("Saved encrypted, device-protected session.dat."));
     } else {
-        post_log_text(TEXT("Could not save session.dat."));
+        post_log_text(TEXT("Could not securely save session.dat."));
     }
 }
 
@@ -4462,6 +7403,7 @@ static int
 load_session_from_file(void)
 {
     WCHAR session_path[MAX_PATH];
+    int existed;
 
     if (!build_app_file_path(L"session.dat", session_path,
         sizeof(session_path) / sizeof(session_path[0])))
@@ -4469,9 +7411,13 @@ load_session_from_file(void)
         return 0;
     }
 
+    existed = GetFileAttributes(session_path) != INVALID_FILE_ATTRIBUTES;
     if (mega_api_load_session_file(session_path)) {
-        append_log_text(TEXT("Loaded saved MEGA session."));
+        append_log_text(TEXT("Loaded encrypted, device-protected MEGA session."));
         return 1;
+    }
+    if (existed) {
+        append_log_text(TEXT("Saved session could not be securely restored; please log in again."));
     }
     return 0;
 }
@@ -4568,6 +7514,17 @@ layout_children(HWND hwnd)
     int bottom_reserved;
     int usable_bottom;
     int spinner_size;
+    int sync_y;
+    int sync_progress_height;
+    int sync_context_height;
+    int sync_current_height;
+    int sync_summary_height;
+    int sync_content_height;
+    int sync_visible_height;
+    int conflict_list_height;
+    int conflict_detail_height;
+    int conflict_button_width;
+    int conflict_y;
 
     GetClientRect(hwnd, &rc);
     margin = scale_x(6);
@@ -4652,17 +7609,119 @@ layout_children(HWND hwnd)
         button_height,
         TRUE);
 
-    MoveWindow(g_sync_status_label,
-        margin, margin,
-        rc.right - rc.left - margin * 2,
-        button_height * 2,
-        TRUE);
+    sync_y = content_top;
+    sync_progress_height = scale_y(14);
+    if (sync_progress_height < 8) {
+        sync_progress_height = 8;
+    }
+    sync_context_height = button_height * 2;
+    sync_current_height = button_height * 2;
+    sync_summary_height = button_height * 4;
+    sync_content_height = button_height + margin
+        + sync_progress_height + margin
+        + sync_context_height + margin
+        + sync_current_height + margin / 2
+        + sync_progress_height + margin
+        + button_height + margin
+        + sync_summary_height + margin;
+    sync_visible_height = usable_bottom - content_top;
+    if (sync_visible_height < 1) {
+        sync_visible_height = 1;
+    }
+    g_sync_scroll_max = sync_content_height > sync_visible_height
+        ? sync_content_height - sync_visible_height : 0;
+    if (g_sync_scroll_pos > g_sync_scroll_max) {
+        g_sync_scroll_pos = g_sync_scroll_max;
+    }
+    if (g_view_mode == MEGACE_VIEW_SYNC) {
+        SetScrollRange(hwnd, SB_VERT, 0, g_sync_scroll_max, TRUE);
+        SetScrollPos(hwnd, SB_VERT, g_sync_scroll_pos, TRUE);
+    } else {
+        SetScrollRange(hwnd, SB_VERT, 0, 0, TRUE);
+    }
+    if (g_sync_scroll_max == 0
+        && sync_visible_height > sync_content_height)
+    {
+        sync_summary_height += sync_visible_height - sync_content_height;
+    }
 
-    MoveWindow(g_sync_progress,
-        margin, margin * 3 + button_height * 2,
+    sync_y -= g_view_mode == MEGACE_VIEW_SYNC ? g_sync_scroll_pos : 0;
+    MoveWindow(g_sync_status_label,
+        margin, sync_y,
         rc.right - rc.left - margin * 2,
         button_height,
         TRUE);
+    sync_y += button_height + margin;
+
+    MoveWindow(g_sync_progress,
+        margin, sync_y,
+        rc.right - rc.left - margin * 2,
+        sync_progress_height,
+        TRUE);
+    sync_y += sync_progress_height + margin;
+
+    MoveWindow(g_sync_context_label,
+        margin, sync_y,
+        rc.right - rc.left - margin * 2,
+        sync_context_height,
+        TRUE);
+    sync_y += sync_context_height + margin;
+
+    MoveWindow(g_sync_current_label,
+        margin, sync_y,
+        rc.right - rc.left - margin * 2,
+        sync_current_height,
+        TRUE);
+    sync_y += sync_current_height + margin / 2;
+
+    MoveWindow(g_sync_transfer_progress,
+        margin, sync_y,
+        rc.right - rc.left - margin * 2,
+        sync_progress_height,
+        TRUE);
+    sync_y += sync_progress_height + margin;
+
+    MoveWindow(g_sync_cancel,
+        margin, sync_y,
+        rc.right - rc.left - margin * 2,
+        button_height,
+        TRUE);
+    sync_y += button_height + margin;
+
+    MoveWindow(g_sync_summary_label,
+        margin, sync_y,
+        rc.right - rc.left - margin * 2,
+        sync_summary_height,
+        TRUE);
+
+    conflict_detail_height = button_height * 5;
+    conflict_list_height = content_height - conflict_detail_height
+        - button_height * 2 - margin * 4;
+    if (conflict_list_height < button_height * 2) {
+        conflict_list_height = button_height * 2;
+        conflict_detail_height = content_height - conflict_list_height
+            - button_height * 2 - margin * 4;
+    }
+    if (conflict_detail_height < button_height * 2) {
+        conflict_detail_height = button_height * 2;
+    }
+    conflict_button_width = (rc.right - rc.left - margin * 3) / 2;
+    conflict_y = content_top;
+    MoveWindow(g_conflict_list, margin, conflict_y,
+        rc.right - rc.left - margin * 2, conflict_list_height, TRUE);
+    conflict_y += conflict_list_height + margin;
+    MoveWindow(g_conflict_detail, margin, conflict_y,
+        rc.right - rc.left - margin * 2, conflict_detail_height, TRUE);
+    conflict_y += conflict_detail_height + margin;
+    MoveWindow(g_conflict_keep_local, margin, conflict_y,
+        conflict_button_width, button_height, TRUE);
+    MoveWindow(g_conflict_keep_mega, margin * 2 + conflict_button_width,
+        conflict_y, conflict_button_width, button_height, TRUE);
+    conflict_y += button_height + margin;
+    MoveWindow(g_conflict_skip, margin, conflict_y,
+        conflict_button_width, button_height, TRUE);
+    MoveWindow(g_conflict_apply, margin * 2 + conflict_button_width,
+        conflict_y, conflict_button_width, button_height, TRUE);
 
     MoveWindow(g_create_folder_label,
         margin, margin,
@@ -4811,6 +7870,72 @@ main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SendMessage(g_sync_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
         SendMessage(g_sync_progress, PBM_SETPOS, 0, 0);
 
+        g_sync_transfer_progress = CreateWindow(PROGRESS_CLASS, TEXT(""),
+            WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0,
+            hwnd, (HMENU)IDC_MEGACE_SYNCTRANSFERPROGRESS,
+            ((LPCREATESTRUCT)lParam)->hInstance, 0);
+        SendMessage(g_sync_transfer_progress, PBM_SETRANGE, 0,
+            MAKELPARAM(0, 100));
+        SendMessage(g_sync_transfer_progress, PBM_SETPOS, 0, 0);
+
+        g_sync_context_label = CreateWindow(TEXT("STATIC"), TEXT(""),
+            WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0,
+            hwnd, (HMENU)IDC_MEGACE_SYNCCONTEXT,
+            ((LPCREATESTRUCT)lParam)->hInstance, 0);
+
+        g_sync_current_label = CreateWindow(TEXT("STATIC"),
+            TEXT("Current: Waiting..."),
+            WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0,
+            hwnd, (HMENU)IDC_MEGACE_SYNCCURRENT,
+            ((LPCREATESTRUCT)lParam)->hInstance, 0);
+
+        g_sync_summary_label = CreateWindow(TEXT("STATIC"), TEXT(""),
+            WS_CHILD | WS_VISIBLE | WS_BORDER,
+            0, 0, 0, 0,
+            hwnd, (HMENU)IDC_MEGACE_SYNCSUMMARY,
+            ((LPCREATESTRUCT)lParam)->hInstance, 0);
+
+        g_sync_cancel = CreateWindow(TEXT("BUTTON"), TEXT("Cancel Sync"),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 0, 0,
+            hwnd, (HMENU)IDC_MEGACE_SYNCCANCEL,
+            ((LPCREATESTRUCT)lParam)->hInstance, 0);
+        EnableWindow(g_sync_cancel, FALSE);
+
+        g_conflict_list = CreateWindow(TEXT("LISTBOX"), TEXT(""),
+            WS_CHILD | WS_BORDER | WS_VSCROLL | LBS_NOTIFY,
+            0, 0, 0, 0,
+            hwnd, (HMENU)IDC_MEGACE_CONFLICTLIST,
+            ((LPCREATESTRUCT)lParam)->hInstance, 0);
+
+        g_conflict_detail = CreateWindow(TEXT("EDIT"),
+            TEXT("No unresolved sync issues."),
+            WS_CHILD | WS_BORDER | WS_VSCROLL | ES_MULTILINE
+                | ES_AUTOVSCROLL | ES_READONLY,
+            0, 0, 0, 0,
+            hwnd, (HMENU)IDC_MEGACE_CONFLICTDETAIL,
+            ((LPCREATESTRUCT)lParam)->hInstance, 0);
+
+        g_conflict_keep_local = CreateWindow(TEXT("BUTTON"),
+            TEXT("Keep Local"), WS_CHILD | BS_PUSHBUTTON,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_MEGACE_KEEPLOCAL,
+            ((LPCREATESTRUCT)lParam)->hInstance, 0);
+        g_conflict_keep_mega = CreateWindow(TEXT("BUTTON"),
+            TEXT("Keep MEGA"), WS_CHILD | BS_PUSHBUTTON,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_MEGACE_KEEPMEGA,
+            ((LPCREATESTRUCT)lParam)->hInstance, 0);
+        g_conflict_skip = CreateWindow(TEXT("BUTTON"), TEXT("Skip"),
+            WS_CHILD | BS_PUSHBUTTON,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_MEGACE_SKIPCONFLICT,
+            ((LPCREATESTRUCT)lParam)->hInstance, 0);
+        g_conflict_apply = CreateWindow(TEXT("BUTTON"),
+            TEXT("Apply Choices"), WS_CHILD | BS_PUSHBUTTON,
+            0, 0, 0, 0, hwnd, (HMENU)IDC_MEGACE_APPLYCONFLICTS,
+            ((LPCREATESTRUCT)lParam)->hInstance, 0);
+
         CreateWindow(TEXT("BUTTON"), TEXT("Save Settings"),
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             0, 0, 0, 0,
@@ -4859,6 +7984,10 @@ main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             0, 0, 0, 0,
             hwnd, (HMENU)IDC_MEGACE_LOG,
             ((LPCREATESTRUCT)lParam)->hInstance, 0);
+        if (g_log != 0) {
+            SendMessage(g_log, EM_LIMITTEXT,
+                MEGACE_LOG_MAX_CHARS + 4096, 0);
+        }
         apply_text_size(hwnd);
         if (load_session_from_file()) {
             g_current_parent[0] = '\0';
@@ -4872,6 +8001,62 @@ main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_SIZE:
         layout_children(hwnd);
         return 0;
+
+    case WM_VSCROLL:
+        if (g_view_mode == MEGACE_VIEW_SYNC) {
+            int position;
+            int line_step;
+            int page_step;
+
+            position = g_sync_scroll_pos;
+            line_step = scale_y(18);
+            if (line_step < 8) {
+                line_step = 8;
+            }
+            page_step = (g_sync_scroll_max + line_step) / 2;
+            if (page_step < line_step) {
+                page_step = line_step;
+            }
+            switch (LOWORD(wParam)) {
+            case SB_LINEUP:
+                position -= line_step;
+                break;
+            case SB_LINEDOWN:
+                position += line_step;
+                break;
+            case SB_PAGEUP:
+                position -= page_step;
+                break;
+            case SB_PAGEDOWN:
+                position += page_step;
+                break;
+            case SB_THUMBPOSITION:
+            case SB_THUMBTRACK:
+                position = (int)(short)HIWORD(wParam);
+                break;
+            case SB_TOP:
+                position = 0;
+                break;
+            case SB_BOTTOM:
+                position = g_sync_scroll_max;
+                break;
+            default:
+                return 0;
+            }
+            if (position < 0) {
+                position = 0;
+            }
+            if (position > g_sync_scroll_max) {
+                position = g_sync_scroll_max;
+            }
+            if (position != g_sync_scroll_pos) {
+                g_sync_scroll_pos = position;
+                layout_children(hwnd);
+                InvalidateRect(hwnd, 0, TRUE);
+            }
+            return 0;
+        }
+        break;
 
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_MEGACE_PING) {
@@ -4902,6 +8087,15 @@ main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             set_view_mode(hwnd, MEGACE_VIEW_LOGS);
             return 0;
         }
+        if (LOWORD(wParam) == IDC_MEGACE_SYNCISSUES) {
+            if (InterlockedCompareExchange(&g_sync_running, 0, 0) != 0) {
+                set_view_mode(hwnd, MEGACE_VIEW_SYNC);
+            } else {
+                populate_conflict_list();
+                set_view_mode(hwnd, MEGACE_VIEW_CONFLICTS);
+            }
+            return 0;
+        }
         if (LOWORD(wParam) == IDC_MEGACE_CRYPTO) {
             run_crypto_self_test();
             return 0;
@@ -4924,6 +8118,39 @@ main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         if (LOWORD(wParam) == IDC_MEGACE_SYNCNOW) {
             start_one_way_sync(hwnd);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_MEGACE_SYNCCANCEL) {
+            if (InterlockedCompareExchange(&g_probe_running, 0, 0) != 0) {
+                InterlockedExchange(&g_sync_cancel_requested, 1);
+                EnableWindow(g_sync_cancel, FALSE);
+                post_sync_status(TEXT("Cancelling safely"),
+                    g_last_sync_status_progress >= 0
+                        ? g_last_sync_status_progress : 0);
+                append_log_text(TEXT("Sync cancellation requested."));
+            }
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_MEGACE_CONFLICTLIST
+            && HIWORD(wParam) == LBN_SELCHANGE)
+        {
+            update_conflict_detail();
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_MEGACE_KEEPLOCAL) {
+            set_selected_conflict_choice(1);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_MEGACE_KEEPMEGA) {
+            set_selected_conflict_choice(2);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_MEGACE_SKIPCONFLICT) {
+            set_selected_conflict_choice(3);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_MEGACE_APPLYCONFLICTS) {
+            start_conflict_resolution(hwnd);
             return 0;
         }
         if (LOWORD(wParam) == IDC_MEGACE_CREATEFOLDER) {
@@ -5038,7 +8265,19 @@ main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_MEGACE_SYNC_STATUS:
         if (lParam != 0) {
             if (g_sync_status_label != 0) {
-                SetWindowText(g_sync_status_label, (const WCHAR *)lParam);
+                if (wParam > 0 && wParam < 100) {
+                    WCHAR status[128];
+
+                    _snwprintf(status,
+                        sizeof(status) / sizeof(status[0]),
+                        L"%s (%u%%)", (const WCHAR *)lParam,
+                        (unsigned int)wParam);
+                    status[(sizeof(status) / sizeof(status[0])) - 1] = L'\0';
+                    SetWindowText(g_sync_status_label, status);
+                } else {
+                    SetWindowText(g_sync_status_label,
+                        (const WCHAR *)lParam);
+                }
             }
             LocalFree((HLOCAL)lParam);
         }
@@ -5047,8 +8286,86 @@ main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         return 0;
 
+    case WM_MEGACE_SYNC_DETAILS:
+        if (lParam != 0) {
+            sync_ui_details *details;
+            WCHAR current[192];
+            WCHAR summary[512];
+
+            details = (sync_ui_details *)lParam;
+            if (g_sync_transfer_progress != 0) {
+                SendMessage(g_sync_transfer_progress, PBM_SETPOS, 0, 0);
+            }
+            if (g_sync_current_label != 0) {
+                if (details->current_action[0] != L'\0') {
+                    _snwprintf(current,
+                        sizeof(current) / sizeof(current[0]),
+                        L"%s: %s", details->current_action,
+                        details->current_item);
+                } else {
+                    _snwprintf(current,
+                        sizeof(current) / sizeof(current[0]),
+                        L"Current: %s", details->current_item);
+                }
+                current[(sizeof(current) / sizeof(current[0])) - 1] = L'\0';
+                SetWindowText(g_sync_current_label, current);
+            }
+            if (g_sync_summary_label != 0 && details->files_seen >= 0) {
+                if (details->total_ms != 0) {
+                    _snwprintf(summary,
+                        sizeof(summary) / sizeof(summary[0]),
+                        L"Files: %d scope / %d seen\r\n"
+                        L"Down %d  Up %d  Folders %d  Skip %d\r\n"
+                        L"Pending %d  Conflicts %d  Failed %d\r\n"
+                        L"Time %lu ms: refresh %lu  scan %lu\r\n"
+                        L"Remote %lu  upload %lu  state %lu ms",
+                        details->files_in_scope, details->files_seen,
+                        details->downloaded, details->uploaded,
+                        details->folders, details->skipped, details->pending,
+                        details->conflicts, details->failed,
+                        (unsigned long)details->total_ms,
+                        (unsigned long)details->refresh_ms,
+                        (unsigned long)details->scan_ms,
+                        (unsigned long)details->remote_ms,
+                        (unsigned long)details->upload_ms,
+                        (unsigned long)details->state_ms);
+                } else {
+                    _snwprintf(summary,
+                        sizeof(summary) / sizeof(summary[0]),
+                        L"Files: %d scope / %d seen\r\n"
+                        L"Down %d  Up %d  Folders %d  Skip %d\r\n"
+                        L"Pending %d  Conflicts %d  Failed %d",
+                        details->files_in_scope, details->files_seen,
+                        details->downloaded, details->uploaded,
+                        details->folders, details->skipped, details->pending,
+                        details->conflicts, details->failed);
+                }
+                summary[(sizeof(summary) / sizeof(summary[0])) - 1] = L'\0';
+                SetWindowText(g_sync_summary_label, summary);
+            }
+            LocalFree((HLOCAL)details);
+        }
+        return 0;
+
+    case WM_MEGACE_TRANSFER_PROGRESS:
+        if (g_sync_transfer_progress != 0) {
+            int percent;
+
+            percent = (int)wParam;
+            if (percent < 0) {
+                percent = 0;
+            }
+            if (percent > 100) {
+                percent = 100;
+            }
+            SendMessage(g_sync_transfer_progress, PBM_SETPOS,
+                (WPARAM)percent, 0);
+        }
+        return 0;
+
     case WM_MEGACE_DONE:
         stop_spinner(hwnd);
+        mega_http_close_idle_connections();
         InterlockedExchange(&g_probe_running, 0);
         EnableWindow(GetDlgItem(hwnd, IDC_MEGACE_PING), TRUE);
         EnableWindow(GetDlgItem(hwnd, IDC_MEGACE_US0), TRUE);
@@ -5061,26 +8378,92 @@ main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
 
     case WM_MEGACE_DOWNLOAD_DONE:
+        mega_http_close_idle_connections();
         InterlockedExchange(&g_probe_running, 0);
         append_log_text(TEXT("Download operation finished."));
         return 0;
 
     case WM_MEGACE_SYNC_DONE:
+    {
+        int conflict_total;
+
+        conflict_total = (int)lParam;
+        mega_http_close_idle_connections();
+        InterlockedExchange(&g_sync_running, 0);
         InterlockedExchange(&g_probe_running, 0);
+        mega_http_set_cancel_callback(0, 0);
+        InterlockedExchange(&g_sync_cancel_requested, 0);
+        if (g_sync_cancel != 0) {
+            EnableWindow(g_sync_cancel, FALSE);
+        }
         populate_file_list();
-        append_log_text(TEXT("Sync operation finished."));
+        append_log_text(wParam != 0
+            ? TEXT("Sync operation cancelled safely.")
+            : TEXT("Sync operation finished."));
         if (g_download_mode == MEGACE_DOWNLOAD_MODE_SYNC
-            && g_sync_conflict_count > 0)
+            && conflict_total > 0)
         {
-            ask_and_resolve_sync_conflicts(hwnd);
+            WCHAR message[320];
+
+            if (wParam != 0) {
+                _snwprintf(message,
+                    sizeof(message) / sizeof(message[0]),
+                    L"Two way sync found %d conflict%s before it was cancelled.\r\n\r\nOpen Sync Issues to review the available choices.",
+                    conflict_total, conflict_total == 1 ? L"" : L"s");
+            } else if (g_sync_conflict_count > 0) {
+                if (conflict_total > g_sync_conflict_count) {
+                    _snwprintf(message,
+                        sizeof(message) / sizeof(message[0]),
+                        L"Two way sync found %d conflicts.\r\n\r\nThe first %d can be reviewed in Sync Issues. Run sync again after resolving them to review the rest.",
+                        conflict_total, g_sync_conflict_count);
+                } else {
+                    _snwprintf(message,
+                        sizeof(message) / sizeof(message[0]),
+                        L"Two way sync found %d conflict%s.\r\n\r\n%d issue%s can be reviewed in Sync Issues.",
+                        conflict_total, conflict_total == 1 ? L"" : L"s",
+                        g_sync_conflict_count,
+                        g_sync_conflict_count == 1 ? L"" : L"s");
+                }
+            } else {
+                _snwprintf(message,
+                    sizeof(message) / sizeof(message[0]),
+                    L"Two way sync found %d conflict%s.\r\n\r\nSee the log for details.",
+                    conflict_total, conflict_total == 1 ? L"" : L"s");
+            }
+            message[(sizeof(message) / sizeof(message[0])) - 1] = L'\0';
+            MessageBox(hwnd, message, TEXT("Sync Conflicts"),
+                MB_OK | MB_ICONEXCLAMATION);
+            if (g_sync_conflict_count > 0) {
+                populate_conflict_list();
+                set_view_mode(hwnd, MEGACE_VIEW_CONFLICTS);
+            }
         }
         return 0;
+    }
 
     case WM_MEGACE_CONFLICT_DONE:
     {
         WCHAR message[96];
+        int i;
+        int write_index;
 
+        mega_http_close_idle_connections();
+        InterlockedExchange(&g_sync_running, 0);
         InterlockedExchange(&g_probe_running, 0);
+        write_index = 0;
+        for (i = 0; i < g_sync_conflict_count; ++i) {
+            if (!g_sync_conflicts[i].resolved) {
+                if (write_index != i) {
+                    g_sync_conflicts[write_index] = g_sync_conflicts[i];
+                }
+                write_index++;
+            }
+        }
+        g_sync_conflict_count = write_index;
+        EnableWindow(g_conflict_apply, TRUE);
+        populate_conflict_list();
+        set_view_mode(hwnd, MEGACE_VIEW_CONFLICTS);
+        populate_file_list();
         _snwprintf(message, sizeof(message) / sizeof(message[0]),
             L"Conflicts resolved: %u, failed: %u",
             (unsigned int)wParam, (unsigned int)lParam);
@@ -5091,6 +8474,7 @@ main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     case WM_MEGACE_SERVER_OP_DONE:
         stop_spinner(hwnd);
+        mega_http_close_idle_connections();
         InterlockedExchange(&g_probe_running, 0);
         populate_file_list();
         set_view_mode(hwnd, MEGACE_VIEW_FILES);
@@ -5102,6 +8486,7 @@ main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     case WM_DESTROY:
         KillTimer(hwnd, MEGACE_COLUMN_SAVE_TIMER);
+        mega_http_close_idle_connections();
         save_file_column_widths();
         if (g_files != 0 && g_files_old_proc != 0) {
             SetWindowLong(g_files, GWL_WNDPROC, (LONG)g_files_old_proc);
@@ -5116,6 +8501,9 @@ main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_menu_bar = 0;
         }
         free_file_item_nodes();
+        node_scope_cache_free();
+        local_snapshot_free();
+        remote_name_cache_free();
         PostQuitMessage(0);
         return 0;
     }
@@ -5154,7 +8542,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmd
     }
 
     hwnd = CreateWindow(MEGACE_CLASS_NAME, MEGACE_TITLE,
-        WS_VISIBLE,
+        WS_VISIBLE | WS_VSCROLL,
         CW_USEDEFAULT, CW_USEDEFAULT,
         CW_USEDEFAULT, CW_USEDEFAULT,
         0, 0, hInstance, 0);

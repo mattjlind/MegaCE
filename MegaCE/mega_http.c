@@ -49,13 +49,28 @@ typedef struct mega_tls_api {
 
 static const char *mega_find_body_start(const char *response);
 static int mega_parse_status_code(const char *response);
+static int mega_response_requests_close(const char *response);
 static void mega_copy_status_line(const char *response, char *out, unsigned int out_size);
 static void mega_copy_headers(const char *response, char *out, unsigned int out_size);
+static void mega_result_error(mega_http_result *result, const char *message);
 
 #define MEGA_HTTP_INITIAL_HEADER_LIMIT 8192U
+#define MEGA_HTTP_IO_BUFFER_SIZE 32768U
+#define MEGA_HTTP_PROGRESS_BYTES 1048576U
+#define MEGA_HTTP_PROGRESS_MS 500U
+#define MEGA_TLS_OPEN_ATTEMPTS 3U
+#define MEGA_TLS_RETRY_DELAY_MS 500U
 
 static mega_http_progress_fn g_progress_callback;
 static void *g_progress_user_data;
+static mega_http_transfer_progress_fn g_transfer_progress_callback;
+static void *g_transfer_progress_user_data;
+static mega_http_cancel_fn g_cancel_callback;
+static void *g_cancel_user_data;
+static mega_tls_api g_cached_tls_api;
+static wm_tls_connection *g_idle_tls_connection;
+static char g_idle_tls_host[128];
+static unsigned short g_idle_tls_port;
 
 static HMODULE
 mega_try_load_bear_tls_path(const WCHAR *path)
@@ -130,6 +145,55 @@ mega_http_progress_message(const char *message)
     }
 }
 
+void
+mega_http_set_transfer_progress_callback(
+    mega_http_transfer_progress_fn callback,
+    void *user_data
+)
+{
+    g_transfer_progress_callback = callback;
+    g_transfer_progress_user_data = user_data;
+}
+
+static void
+mega_http_transfer_progress(
+    unsigned __int64 bytes_done,
+    unsigned __int64 bytes_total
+)
+{
+    if (g_transfer_progress_callback != 0) {
+        g_transfer_progress_callback(bytes_done, bytes_total,
+            g_transfer_progress_user_data);
+    }
+}
+
+void
+mega_http_set_cancel_callback(
+    mega_http_cancel_fn callback,
+    void *user_data
+)
+{
+    g_cancel_callback = callback;
+    g_cancel_user_data = user_data;
+}
+
+static int
+mega_http_is_cancelled(mega_http_result *result)
+{
+    if (g_cancel_callback != 0 && g_cancel_callback(g_cancel_user_data)) {
+        mega_result_error(result, "operation cancelled");
+        return 1;
+    }
+    return 0;
+}
+
+int
+mega_http_cancel_requested(void)
+{
+    return g_cancel_callback != 0
+        && g_cancel_callback(g_cancel_user_data);
+}
+
 static void
 mega_http_progress(const char *message)
 {
@@ -157,6 +221,10 @@ static int
 mega_load_tls(mega_tls_api *api, mega_http_result *result)
 {
     memset(api, 0, sizeof(*api));
+    if (g_cached_tls_api.dll != 0) {
+        *api = g_cached_tls_api;
+        return 1;
+    }
 
     api->dll = mega_http_load_bear_tls_dll();
     if (api->dll == 0) {
@@ -176,16 +244,184 @@ mega_load_tls(mega_tls_api *api, mega_http_result *result)
         return 0;
     }
 
+    g_cached_tls_api = *api;
     return 1;
 }
 
 static void
 mega_unload_tls(mega_tls_api *api)
 {
-    if (api != 0 && api->dll != 0) {
-        FreeLibrary(api->dll);
+    if (api != 0) {
         memset(api, 0, sizeof(*api));
     }
+}
+
+static void
+mega_discard_idle_connection(void)
+{
+    wm_tls_connection *conn;
+
+    conn = g_idle_tls_connection;
+    g_idle_tls_connection = 0;
+    g_idle_tls_host[0] = '\0';
+    g_idle_tls_port = 0;
+    if (conn != 0 && g_cached_tls_api.close != 0) {
+        g_cached_tls_api.close(conn);
+    }
+}
+
+void
+mega_http_close_idle_connections(void)
+{
+    mega_discard_idle_connection();
+}
+
+static wm_tls_connection *
+mega_take_idle_connection(
+    const char *host,
+    unsigned short port,
+    int *reused
+)
+{
+    wm_tls_connection *conn;
+
+    if (reused != 0) {
+        *reused = 0;
+    }
+    if (g_idle_tls_connection == 0) {
+        return 0;
+    }
+    if (g_idle_tls_port != port || strcmp(g_idle_tls_host, host) != 0) {
+        mega_discard_idle_connection();
+        return 0;
+    }
+
+    conn = g_idle_tls_connection;
+    g_idle_tls_connection = 0;
+    g_idle_tls_host[0] = '\0';
+    g_idle_tls_port = 0;
+    if (reused != 0) {
+        *reused = 1;
+    }
+    return conn;
+}
+
+static void
+mega_release_connection(
+    mega_tls_api *api,
+    wm_tls_connection *conn,
+    const char *host,
+    unsigned short port,
+    int keep
+)
+{
+    if (conn == 0) {
+        return;
+    }
+    if (keep && g_idle_tls_connection == 0) {
+        g_idle_tls_connection = conn;
+        _snprintf(g_idle_tls_host, sizeof(g_idle_tls_host), "%s", host);
+        g_idle_tls_host[sizeof(g_idle_tls_host) - 1] = '\0';
+        g_idle_tls_port = port;
+        return;
+    }
+    api->close(conn);
+}
+
+static int
+mega_wait_for_tls_retry(DWORD delay_ms, mega_http_result *result)
+{
+    DWORD waited;
+
+    waited = 0;
+    while (waited < delay_ms) {
+        DWORD slice;
+
+        if (mega_http_is_cancelled(result)) {
+            return 0;
+        }
+        slice = delay_ms - waited;
+        if (slice > 100U) {
+            slice = 100U;
+        }
+        Sleep(slice);
+        waited += slice;
+    }
+    return !mega_http_is_cancelled(result);
+}
+
+static int
+mega_open_tls_connection(
+    mega_tls_api *api,
+    const char *host,
+    unsigned short port,
+    wm_tls_connection **out_conn,
+    mega_http_result *result
+)
+{
+    wm_https_result tls_result;
+    unsigned int attempt;
+    int last_tls_error;
+    int last_wsa_error;
+
+    if (api == 0 || host == 0 || out_conn == 0) {
+        mega_result_error(result, "invalid TLS open arguments");
+        return 0;
+    }
+
+    *out_conn = 0;
+    last_tls_error = 0;
+    last_wsa_error = 0;
+    mega_http_progress("Opening TLS connection...");
+    for (attempt = 0; attempt < MEGA_TLS_OPEN_ATTEMPTS; ++attempt) {
+        DWORD delay_ms;
+
+        if (mega_http_is_cancelled(result)) {
+            return 0;
+        }
+        memset(&tls_result, 0, sizeof(tls_result));
+        *out_conn = 0;
+        if (api->open(host, port, host, out_conn, &tls_result)) {
+            if (attempt > 0) {
+                mega_http_progress("TLS connection opened after retry.");
+            }
+            return 1;
+        }
+
+        last_tls_error = tls_result.tls_error;
+        last_wsa_error = tls_result.wsa_error;
+        if (*out_conn != 0) {
+            api->close(*out_conn);
+            *out_conn = 0;
+        }
+        if (attempt + 1 >= MEGA_TLS_OPEN_ATTEMPTS) {
+            break;
+        }
+
+        {
+            char progress[96];
+
+            _snprintf(progress, sizeof(progress),
+                "TLS open failed; retrying (%u/%u)...",
+                attempt + 2, MEGA_TLS_OPEN_ATTEMPTS);
+            progress[sizeof(progress) - 1] = '\0';
+            mega_http_progress(progress);
+        }
+        delay_ms = MEGA_TLS_RETRY_DELAY_MS * (attempt + 1);
+        if (!mega_wait_for_tls_retry(delay_ms, result)) {
+            return 0;
+        }
+    }
+
+    if (result != 0) {
+        result->tls_error = last_tls_error;
+        result->wsa_error = last_wsa_error;
+        _snprintf(result->error, sizeof(result->error),
+            "TLS open failed after %u attempts (TLS=%d, WSA=%d)",
+            MEGA_TLS_OPEN_ATTEMPTS, last_tls_error, last_wsa_error);
+        result->error[sizeof(result->error) - 1] = '\0';
+    }
+    return 0;
 }
 
 static int
@@ -200,6 +436,9 @@ mega_write_all(
     unsigned int written;
     wm_https_result tls_result;
 
+    if (mega_http_is_cancelled(result)) {
+        return 0;
+    }
     if (!api->write(conn, data, data_len, &written, &tls_result)) {
         if (result != 0) {
             result->tls_error = tls_result.tls_error;
@@ -339,7 +578,90 @@ mega_header_has_name(const char *line, const char *name)
 }
 
 static int
-mega_parse_content_length(const char *response, int *out_length)
+mega_ascii_token_equals(
+    const char *token,
+    unsigned int token_len,
+    const char *value
+)
+{
+    unsigned int i;
+
+    if (strlen(value) != token_len) {
+        return 0;
+    }
+    for (i = 0; i < token_len; ++i) {
+        char a;
+        char b;
+
+        a = token[i];
+        b = value[i];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (char)(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int
+mega_response_requests_close(const char *response)
+{
+    const char *body;
+    const char *line;
+
+    body = mega_find_body_start(response);
+    if (response == 0 || body == 0) {
+        return 1;
+    }
+
+    line = response;
+    while (line < body) {
+        const char *next;
+
+        next = strstr(line, "\r\n");
+        if (next == 0 || next > body) {
+            break;
+        }
+        if (mega_header_has_name(line, "Connection")) {
+            const char *value;
+
+            value = strchr(line, ':');
+            if (value != 0 && value < next) {
+                value++;
+                while (value < next) {
+                    const char *token;
+
+                    while (value < next
+                        && (*value == ' ' || *value == '\t' || *value == ','))
+                    {
+                        value++;
+                    }
+                    token = value;
+                    while (value < next && *value != ','
+                        && *value != ' ' && *value != '\t')
+                    {
+                        value++;
+                    }
+                    if (mega_ascii_token_equals(token,
+                        (unsigned int)(value - token), "close"))
+                    {
+                        return 1;
+                    }
+                }
+            }
+        }
+        line = next + 2;
+    }
+    return 0;
+}
+
+static int
+mega_parse_content_length(const char *response, __int64 *out_length)
 {
     const char *body;
     const char *line;
@@ -363,6 +685,8 @@ mega_parse_content_length(const char *response, int *out_length)
 
         if (mega_header_has_name(line, "Content-Length")) {
             const char *value;
+            unsigned __int64 parsed;
+            int digits;
 
             value = strchr(line, ':');
             if (value != 0 && value < next) {
@@ -370,7 +694,32 @@ mega_parse_content_length(const char *response, int *out_length)
                 while (*value == ' ' || *value == '\t') {
                     value++;
                 }
-                *out_length = atoi(value);
+                parsed = 0;
+                digits = 0;
+                while (value < next && *value >= '0' && *value <= '9') {
+                    unsigned int digit;
+
+                    digit = (unsigned int)(*value - '0');
+                    if (parsed > 0x7fffffffffffffffULL / 10ULL
+                        || (parsed == 0x7fffffffffffffffULL / 10ULL
+                            && digit > (unsigned int)
+                                (0x7fffffffffffffffULL % 10ULL)))
+                    {
+                        *out_length = -2;
+                        return 0;
+                    }
+                    parsed = parsed * 10ULL + digit;
+                    value++;
+                    digits++;
+                }
+                while (value < next && (*value == ' ' || *value == '\t')) {
+                    value++;
+                }
+                if (digits == 0 || value != next) {
+                    *out_length = -2;
+                    return 0;
+                }
+                *out_length = (__int64)parsed;
                 return 1;
             }
         }
@@ -379,6 +728,35 @@ mega_parse_content_length(const char *response, int *out_length)
     }
 
     return 0;
+}
+
+static int
+mega_response_is_complete(
+    int ok,
+    int headers_done,
+    __int64 content_length,
+    unsigned __int64 body_bytes,
+    mega_http_result *result
+)
+{
+    if (!ok) {
+        return 0;
+    }
+    if (!headers_done) {
+        mega_result_error(result, "incomplete HTTP response headers");
+        return 0;
+    }
+    if (content_length < -1) {
+        mega_result_error(result, "invalid HTTP Content-Length");
+        return 0;
+    }
+    if (content_length >= 0
+        && body_bytes != (unsigned __int64)content_length)
+    {
+        mega_result_error(result, "incomplete HTTP response body");
+        return 0;
+    }
+    return 1;
 }
 
 static int
@@ -425,9 +803,11 @@ mega_parse_https_url(
 }
 
 int
-mega_http_download_url_to_file(
+mega_http_download_url_to_file_ex(
     const char *url,
     const WCHAR *file_path,
+    mega_http_data_transform_fn transform,
+    void *transform_user_data,
     mega_http_result *result
 )
 {
@@ -435,15 +815,18 @@ mega_http_download_url_to_file(
     char path[1024];
     char header[1536];
     char response_header[4096];
-    unsigned char buffer[2048];
+    unsigned char *buffer;
     mega_tls_api api;
     wm_tls_connection *conn;
     wm_https_result tls_result;
     HANDLE file;
     unsigned int header_used;
-    int content_length;
+    __int64 content_length;
     int header_done;
     int ok;
+    unsigned __int64 body_used;
+    unsigned __int64 last_progress_bytes;
+    DWORD last_progress_tick;
 
     mega_result_clear(result);
     if (url == 0 || file_path == 0) {
@@ -454,6 +837,7 @@ mega_http_download_url_to_file(
         mega_result_error(result, "could not parse download URL");
         return 0;
     }
+    mega_http_close_idle_connections();
 
     file = CreateFile(file_path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, 0);
@@ -461,23 +845,25 @@ mega_http_download_url_to_file(
         mega_result_error(result, "could not create download file");
         return 0;
     }
+    buffer = (unsigned char *)LocalAlloc(LPTR, MEGA_HTTP_IO_BUFFER_SIZE);
+    if (buffer == 0) {
+        CloseHandle(file);
+        mega_result_error(result, "could not allocate download buffer");
+        return 0;
+    }
 
     mega_http_progress("Loading TLS DLL...");
     if (!mega_load_tls(&api, result)) {
+        LocalFree((HLOCAL)buffer);
         CloseHandle(file);
         return 0;
     }
 
     conn = 0;
-    mega_http_progress("Opening TLS connection...");
-    if (!api.open(host, 443, host, &conn, &tls_result)) {
-        if (result != 0) {
-            result->tls_error = tls_result.tls_error;
-            result->wsa_error = tls_result.wsa_error;
-        }
+    if (!mega_open_tls_connection(&api, host, 443, &conn, result)) {
         mega_unload_tls(&api);
+        LocalFree((HLOCAL)buffer);
         CloseHandle(file);
-        mega_result_error(result, "TLS open failed");
         return 0;
     }
 
@@ -496,14 +882,32 @@ mega_http_download_url_to_file(
     header_used = 0;
     content_length = -1;
     header_done = 0;
+    body_used = 0;
+    last_progress_bytes = 0;
+    last_progress_tick = GetTickCount();
     response_header[0] = '\0';
 
     mega_http_progress("Reading HTTP response...");
     while (ok) {
         unsigned int got;
+        unsigned int read_size;
 
         got = 0;
-        if (!api.read(conn, buffer, sizeof(buffer), &got, &tls_result)) {
+        if (header_done) {
+            read_size = MEGA_HTTP_IO_BUFFER_SIZE;
+        } else {
+            if (header_used >= sizeof(response_header) - 1) {
+                mega_result_error(result, "download response header too large");
+                ok = 0;
+                break;
+            }
+            read_size = sizeof(response_header) - header_used - 1;
+        }
+        if (mega_http_is_cancelled(result)) {
+            ok = 0;
+            break;
+        }
+        if (!api.read(conn, buffer, read_size, &got, &tls_result)) {
             if (result != 0) {
                 result->tls_error = tls_result.tls_error;
                 result->wsa_error = tls_result.wsa_error;
@@ -541,10 +945,10 @@ mega_http_download_url_to_file(
                         sizeof(result->status_line));
                     mega_copy_headers(response_header, result->headers,
                         sizeof(result->headers));
-                    mega_parse_content_length(response_header, &content_length);
                     result->ok = result->status_code >= 200
                         && result->status_code < 300;
                 }
+                mega_parse_content_length(response_header, &content_length);
                 if (result != 0 && !result->ok) {
                     mega_result_error(result, "HTTP request returned non-2xx status");
                     ok = 0;
@@ -555,6 +959,14 @@ mega_http_download_url_to_file(
                 if (body_offset < header_used) {
                     body_len = header_used - body_offset;
                     written = 0;
+                    if (transform != 0
+                        && !transform((unsigned char *)response_header
+                            + body_offset, body_len, transform_user_data))
+                    {
+                        mega_result_error(result, "download transform failed");
+                        ok = 0;
+                        break;
+                    }
                     if (!WriteFile(file, response_header + body_offset,
                         body_len, &written, 0)
                         || written != body_len)
@@ -564,15 +976,20 @@ mega_http_download_url_to_file(
                         break;
                     }
                     if (result != 0) {
-                        result->body_bytes += (int)body_len;
+                        result->body_bytes += body_len;
                     }
+                    body_used += body_len;
                     if (content_length >= 0
                         && result != 0
-                        && result->body_bytes >= content_length)
+                        && result->body_bytes
+                            >= (unsigned __int64)content_length)
                     {
                         break;
                     }
                 }
+                mega_http_transfer_progress(body_used,
+                    content_length >= 0
+                        ? (unsigned __int64)content_length : 0ULL);
             } else if (header_used >= sizeof(response_header) - 1) {
                 mega_result_error(result, "download response header too large");
                 ok = 0;
@@ -582,26 +999,65 @@ mega_http_download_url_to_file(
             DWORD written;
 
             written = 0;
+            if (transform != 0
+                && !transform(buffer, got, transform_user_data))
+            {
+                mega_result_error(result, "download transform failed");
+                ok = 0;
+                break;
+            }
             if (!WriteFile(file, buffer, got, &written, 0) || written != got) {
                 mega_result_error(result, "download file write failed");
                 ok = 0;
                 break;
             }
+            body_used += got;
             if (result != 0) {
                 char progress[80];
+                DWORD now;
 
-                result->body_bytes += (int)got;
-                _snprintf(progress, sizeof(progress),
-                    "Downloaded %d%s%d bytes...",
-                    result->body_bytes,
-                    content_length >= 0 ? "/" : " ",
-                    content_length >= 0 ? content_length : 0);
-                progress[sizeof(progress) - 1] = '\0';
-                mega_http_progress(progress);
-                if (content_length >= 0 && result->body_bytes >= content_length) {
+                result->body_bytes += got;
+                now = GetTickCount();
+                if (result->body_bytes - last_progress_bytes
+                        >= MEGA_HTTP_PROGRESS_BYTES
+                    || (DWORD)(now - last_progress_tick)
+                        >= MEGA_HTTP_PROGRESS_MS
+                    || (content_length >= 0
+                        && result->body_bytes
+                            >= (unsigned __int64)content_length))
+                {
+                    _snprintf(progress, sizeof(progress),
+                        "Downloaded %I64u%s%I64u bytes...",
+                        result->body_bytes,
+                        content_length >= 0 ? "/" : " ",
+                        content_length >= 0
+                            ? (unsigned __int64)content_length : 0ULL);
+                    progress[sizeof(progress) - 1] = '\0';
+                    mega_http_progress(progress);
+                    mega_http_transfer_progress(body_used,
+                        content_length >= 0
+                            ? (unsigned __int64)content_length : 0ULL);
+                    last_progress_bytes = result->body_bytes;
+                    last_progress_tick = now;
+                }
+                if (content_length >= 0 && result->body_bytes
+                    >= (unsigned __int64)content_length)
+                {
                     break;
                 }
             }
+        }
+    }
+
+    ok = mega_response_is_complete(ok, header_done, content_length,
+        body_used, result);
+    if (ok) {
+        if (content_length == 0) {
+            mega_http_transfer_progress(1, 1);
+        } else {
+            mega_http_transfer_progress(body_used,
+                content_length > 0
+                    ? (unsigned __int64)content_length : body_used);
         }
     }
 
@@ -609,6 +1065,8 @@ mega_http_download_url_to_file(
     api.close(conn);
     mega_unload_tls(&api);
     CloseHandle(file);
+    mega_crypto_zero(buffer, MEGA_HTTP_IO_BUFFER_SIZE);
+    LocalFree((HLOCAL)buffer);
 
     if (result != 0) {
         result->ok = ok && result->status_code >= 200 && result->status_code < 300;
@@ -617,9 +1075,21 @@ mega_http_download_url_to_file(
 }
 
 int
-mega_http_upload_file_to_url(
+mega_http_download_url_to_file(
     const char *url,
     const WCHAR *file_path,
+    mega_http_result *result
+)
+{
+    return mega_http_download_url_to_file_ex(url, file_path, 0, 0, result);
+}
+
+int
+mega_http_upload_file_to_url_ex(
+    const char *url,
+    const WCHAR *file_path,
+    mega_http_data_transform_fn transform,
+    void *transform_user_data,
     char *response_body,
     unsigned int response_body_size,
     mega_http_result *result
@@ -629,7 +1099,7 @@ mega_http_upload_file_to_url(
     char path[1024];
     char header[1536];
     char initial_response[MEGA_HTTP_INITIAL_HEADER_LIMIT];
-    unsigned char buffer[2048];
+    unsigned char *buffer;
     mega_tls_api api;
     wm_tls_connection *conn;
     wm_https_result tls_result;
@@ -640,10 +1110,12 @@ mega_http_upload_file_to_url(
     unsigned __int64 sent_size;
     unsigned int used;
     unsigned int body_used;
-    unsigned int total_received;
+    unsigned __int64 total_received;
     int headers_done;
-    int content_length;
+    __int64 content_length;
     int ok;
+    unsigned __int64 last_progress_bytes;
+    DWORD last_progress_tick;
 
     mega_result_clear(result);
     if (response_body != 0 && response_body_size > 0) {
@@ -659,11 +1131,18 @@ mega_http_upload_file_to_url(
         mega_result_error(result, "could not parse upload URL");
         return 0;
     }
+    mega_http_close_idle_connections();
 
     file = CreateFile(file_path, GENERIC_READ, FILE_SHARE_READ, 0,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (file == INVALID_HANDLE_VALUE) {
         mega_result_error(result, "could not open upload file");
+        return 0;
+    }
+    buffer = (unsigned char *)LocalAlloc(LPTR, MEGA_HTTP_IO_BUFFER_SIZE);
+    if (buffer == 0) {
+        CloseHandle(file);
+        mega_result_error(result, "could not allocate upload buffer");
         return 0;
     }
 
@@ -674,20 +1153,16 @@ mega_http_upload_file_to_url(
 
     mega_http_progress("Loading TLS DLL...");
     if (!mega_load_tls(&api, result)) {
+        LocalFree((HLOCAL)buffer);
         CloseHandle(file);
         return 0;
     }
 
     conn = 0;
-    mega_http_progress("Opening TLS connection...");
-    if (!api.open(host, 443, host, &conn, &tls_result)) {
-        if (result != 0) {
-            result->tls_error = tls_result.tls_error;
-            result->wsa_error = tls_result.wsa_error;
-        }
+    if (!mega_open_tls_connection(&api, host, 443, &conn, result)) {
         mega_unload_tls(&api);
+        LocalFree((HLOCAL)buffer);
         CloseHandle(file);
-        mega_result_error(result, "TLS open failed");
         return 0;
     }
 
@@ -697,20 +1172,27 @@ mega_http_upload_file_to_url(
         "User-Agent: MegaCE/0.1 (Windows CE)\r\n"
         "Accept: */*\r\n"
         "Content-Type: application/octet-stream\r\n"
-        "Content-Length: %lu\r\n"
+        "Content-Length: %I64u\r\n"
         "Connection: close\r\n"
         "\r\n",
-        path, host, (unsigned long)total_size);
+        path, host, total_size);
     header[sizeof(header) - 1] = '\0';
 
     mega_http_progress("Sending upload request...");
     ok = mega_write_all(&api, conn, header, (unsigned int)strlen(header), result);
     sent_size = 0;
+    mega_http_transfer_progress(0, total_size);
+    last_progress_bytes = 0;
+    last_progress_tick = GetTickCount();
     while (ok) {
         DWORD read_bytes;
 
+        if (mega_http_is_cancelled(result)) {
+            ok = 0;
+            break;
+        }
         read_bytes = 0;
-        if (!ReadFile(file, buffer, sizeof(buffer), &read_bytes, 0)) {
+        if (!ReadFile(file, buffer, MEGA_HTTP_IO_BUFFER_SIZE, &read_bytes, 0)) {
             mega_result_error(result, "upload file read failed");
             ok = 0;
             break;
@@ -718,19 +1200,36 @@ mega_http_upload_file_to_url(
         if (read_bytes == 0) {
             break;
         }
+        if (transform != 0
+            && !transform(buffer, read_bytes, transform_user_data))
+        {
+            mega_result_error(result, "upload transform failed");
+            ok = 0;
+            break;
+        }
         if (!mega_write_all(&api, conn, buffer, read_bytes, result)) {
             ok = 0;
             break;
         }
         sent_size += read_bytes;
-        if ((sent_size % 65536) == 0 || sent_size == total_size) {
+        if (sent_size - last_progress_bytes >= MEGA_HTTP_PROGRESS_BYTES
+            || (DWORD)(GetTickCount() - last_progress_tick)
+                >= MEGA_HTTP_PROGRESS_MS
+            || sent_size == total_size)
+        {
             char progress[80];
 
-            _snprintf(progress, sizeof(progress), "Uploaded %lu/%lu bytes...",
-                (unsigned long)sent_size, (unsigned long)total_size);
+            _snprintf(progress, sizeof(progress), "Uploaded %I64u/%I64u bytes...",
+                sent_size, total_size);
             progress[sizeof(progress) - 1] = '\0';
             mega_http_progress(progress);
+            mega_http_transfer_progress(sent_size, total_size);
+            last_progress_bytes = sent_size;
+            last_progress_tick = GetTickCount();
         }
+    }
+    if (ok && sent_size == total_size && total_size == 0) {
+        mega_http_transfer_progress(1, 1);
     }
 
     mega_http_progress("Reading HTTP response...");
@@ -747,7 +1246,8 @@ mega_http_upload_file_to_url(
 
         if (headers_done) {
             if (body_used >= response_body_size - 1) {
-                mega_http_progress("HTTP response reached local buffer limit.");
+                mega_result_error(result, "HTTP response body too large");
+                ok = 0;
                 break;
             }
             read_target = response_body + body_used;
@@ -763,6 +1263,10 @@ mega_http_upload_file_to_url(
         }
 
         got = 0;
+        if (mega_http_is_cancelled(result)) {
+            ok = 0;
+            break;
+        }
         if (!api.read(conn, read_target, read_space, &got, &tls_result)) {
             if (result != 0) {
                 result->tls_error = tls_result.tls_error;
@@ -791,7 +1295,9 @@ mega_http_upload_file_to_url(
                 header_body_bytes = used
                     - (unsigned int)(body_start - initial_response);
                 if (header_body_bytes >= response_body_size) {
-                    header_body_bytes = response_body_size - 1;
+                    mega_result_error(result, "HTTP response body too large");
+                    ok = 0;
+                    break;
                 }
                 if (result != 0) {
                     result->status_code = mega_parse_status_code(initial_response);
@@ -809,21 +1315,26 @@ mega_http_upload_file_to_url(
         }
 
         if (headers_done && content_length >= 0
-            && body_used >= (unsigned int)content_length)
+            && (unsigned __int64)body_used
+                >= (unsigned __int64)content_length)
         {
             break;
         }
     }
 
+    ok = mega_response_is_complete(ok, headers_done, content_length,
+        body_used, result);
+
     mega_http_progress("Closing TLS connection...");
     api.close(conn);
     mega_unload_tls(&api);
     CloseHandle(file);
-    mega_crypto_zero(buffer, sizeof(buffer));
+    mega_crypto_zero(buffer, MEGA_HTTP_IO_BUFFER_SIZE);
+    LocalFree((HLOCAL)buffer);
 
     if (result != 0) {
-        result->bytes_received = (int)total_received;
-        result->body_bytes = (int)body_used;
+        result->bytes_received = total_received;
+        result->body_bytes = body_used;
         if (!headers_done) {
             result->status_code = mega_parse_status_code(initial_response);
             mega_copy_status_line(initial_response, result->status_line,
@@ -838,6 +1349,19 @@ mega_http_upload_file_to_url(
     }
 
     return result != 0 ? result->ok : ok;
+}
+
+int
+mega_http_upload_file_to_url(
+    const char *url,
+    const WCHAR *file_path,
+    char *response_body,
+    unsigned int response_body_size,
+    mega_http_result *result
+)
+{
+    return mega_http_upload_file_to_url_ex(url, file_path, 0, 0,
+        response_body, response_body_size, result);
 }
 
 int
@@ -876,10 +1400,11 @@ mega_http_post_ex(
     char header[512];
     unsigned int used;
     unsigned int body_used;
-    unsigned int total_received;
+    unsigned __int64 total_received;
     int headers_done;
-    int content_length;
+    __int64 content_length;
     int ok;
+    int keep_connection;
 
     mega_result_clear(result);
     if (response_body != 0 && response_body_size > 0) {
@@ -898,16 +1423,14 @@ mega_http_post_ex(
         return 0;
     }
 
-    conn = 0;
-    mega_http_progress("Opening TLS connection...");
-    if (!api.open(host, port, host, &conn, &tls_result)) {
-        if (result != 0) {
-            result->tls_error = tls_result.tls_error;
-            result->wsa_error = tls_result.wsa_error;
+    conn = mega_take_idle_connection(host, port, 0);
+    if (conn != 0) {
+        mega_http_progress("Reusing TLS connection...");
+    } else {
+        if (!mega_open_tls_connection(&api, host, port, &conn, result)) {
+            mega_unload_tls(&api);
+            return 0;
         }
-        mega_unload_tls(&api);
-        mega_result_error(result, "TLS open failed");
-        return 0;
     }
 
     _snprintf(header, sizeof(header),
@@ -917,7 +1440,7 @@ mega_http_post_ex(
         "Accept: application/json\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: %u\r\n"
-        "Connection: close\r\n",
+        "Connection: keep-alive\r\n",
         path, host, body_len);
     header[sizeof(header) - 1] = '\0';
 
@@ -947,7 +1470,8 @@ mega_http_post_ex(
 
         if (headers_done) {
             if (body_used >= response_body_size - 1) {
-                mega_http_progress("HTTP response reached local buffer limit.");
+                mega_result_error(result, "HTTP response body too large");
+                ok = 0;
                 break;
             }
             read_target = response_body + body_used;
@@ -963,6 +1487,10 @@ mega_http_post_ex(
         }
 
         got = 0;
+        if (mega_http_is_cancelled(result)) {
+            ok = 0;
+            break;
+        }
         if (!api.read(conn, read_target, read_space, &got, &tls_result))
         {
             if (result != 0) {
@@ -992,8 +1520,9 @@ mega_http_post_ex(
             if (body_start != 0) {
                 header_body_bytes = used - (unsigned int)(body_start - initial_response);
                 if (header_body_bytes >= response_body_size) {
-                    header_body_bytes = response_body_size - 1;
-                    mega_http_progress("HTTP response reached local buffer limit.");
+                    mega_result_error(result, "HTTP response body too large");
+                    ok = 0;
+                    break;
                 }
 
                 if (result != 0) {
@@ -1002,8 +1531,8 @@ mega_http_post_ex(
                         sizeof(result->status_line));
                     mega_copy_headers(initial_response, result->headers,
                         sizeof(result->headers));
-                    mega_parse_content_length(initial_response, &content_length);
                 }
+                mega_parse_content_length(initial_response, &content_length);
 
                 memmove(response_body, body_start, header_body_bytes);
                 body_used = header_body_bytes;
@@ -1027,18 +1556,27 @@ mega_http_post_ex(
         }
 
         if (headers_done && content_length >= 0
-            && body_used >= (unsigned int)content_length)
+            && (unsigned __int64)body_used
+                >= (unsigned __int64)content_length)
         {
             break;
         }
     }
 
-    mega_http_progress("Closing TLS connection...");
-    api.close(conn);
+    ok = mega_response_is_complete(ok, headers_done, content_length,
+        body_used, result);
+
+    keep_connection = ok && content_length >= 0
+        && strncmp(initial_response, "HTTP/1.1", 8) == 0
+        && !mega_response_requests_close(initial_response);
+    mega_http_progress(keep_connection
+        ? "Keeping TLS connection open..."
+        : "Closing TLS connection...");
+    mega_release_connection(&api, conn, host, port, keep_connection);
     mega_unload_tls(&api);
 
     if (result != 0) {
-        result->bytes_received = (int)total_received;
+        result->bytes_received = total_received;
         if (!headers_done) {
             result->status_code = mega_parse_status_code(initial_response);
             mega_copy_status_line(initial_response, result->status_line,
@@ -1058,7 +1596,7 @@ mega_http_post_ex(
             }
         }
         result->ok = ok && result->status_code >= 200 && result->status_code < 300;
-        result->body_bytes = (int)body_used;
+        result->body_bytes = body_used;
         if (ok && !result->ok) {
             mega_result_error(result, "HTTP request returned non-2xx status");
         }
@@ -1080,18 +1618,19 @@ mega_http_post_file_ex(
 )
 {
     char initial_response[MEGA_HTTP_INITIAL_HEADER_LIMIT];
-    char read_buffer[4096];
+    char *read_buffer;
     mega_tls_api api;
     wm_tls_connection *conn;
     wm_https_result tls_result;
     HANDLE file;
     char header[512];
     unsigned int used;
-    unsigned int body_used;
-    unsigned int total_received;
+    unsigned __int64 body_used;
+    unsigned __int64 total_received;
     int headers_done;
-    int content_length;
+    __int64 content_length;
     int ok;
+    int keep_connection;
 
     mega_result_clear(result);
     if (host == 0 || path == 0 || response_file_path == 0) {
@@ -1105,26 +1644,32 @@ mega_http_post_file_ex(
         mega_result_error(result, "Could not create HTTP response file");
         return 0;
     }
+    read_buffer = (char *)LocalAlloc(LPTR, MEGA_HTTP_IO_BUFFER_SIZE);
+    if (read_buffer == 0) {
+        CloseHandle(file);
+        mega_result_error(result, "Could not allocate HTTP response buffer");
+        return 0;
+    }
 
     initial_response[0] = '\0';
 
     mega_http_progress("Loading TLS DLL...");
     if (!mega_load_tls(&api, result)) {
+        LocalFree((HLOCAL)read_buffer);
         CloseHandle(file);
         return 0;
     }
 
-    conn = 0;
-    mega_http_progress("Opening TLS connection...");
-    if (!api.open(host, port, host, &conn, &tls_result)) {
-        if (result != 0) {
-            result->tls_error = tls_result.tls_error;
-            result->wsa_error = tls_result.wsa_error;
+    conn = mega_take_idle_connection(host, port, 0);
+    if (conn != 0) {
+        mega_http_progress("Reusing TLS connection...");
+    } else {
+        if (!mega_open_tls_connection(&api, host, port, &conn, result)) {
+            mega_unload_tls(&api);
+            LocalFree((HLOCAL)read_buffer);
+            CloseHandle(file);
+            return 0;
         }
-        mega_unload_tls(&api);
-        CloseHandle(file);
-        mega_result_error(result, "TLS open failed");
-        return 0;
     }
 
     _snprintf(header, sizeof(header),
@@ -1134,7 +1679,7 @@ mega_http_post_file_ex(
         "Accept: application/json\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: %u\r\n"
-        "Connection: close\r\n",
+        "Connection: keep-alive\r\n",
         path, host, body_len);
     header[sizeof(header) - 1] = '\0';
 
@@ -1164,7 +1709,7 @@ mega_http_post_file_ex(
 
         if (headers_done) {
             read_target = read_buffer;
-            read_space = sizeof(read_buffer);
+            read_space = MEGA_HTTP_IO_BUFFER_SIZE;
         } else {
             if (used >= sizeof(initial_response) - 1) {
                 mega_result_error(result, "HTTP response headers too large");
@@ -1176,6 +1721,10 @@ mega_http_post_file_ex(
         }
 
         got = 0;
+        if (mega_http_is_cancelled(result)) {
+            ok = 0;
+            break;
+        }
         if (!api.read(conn, read_target, read_space, &got, &tls_result)) {
             if (result != 0) {
                 result->tls_error = tls_result.tls_error;
@@ -1216,8 +1765,8 @@ mega_http_post_file_ex(
                         sizeof(result->status_line));
                     mega_copy_headers(initial_response, result->headers,
                         sizeof(result->headers));
-                    mega_parse_content_length(initial_response, &content_length);
                 }
+                mega_parse_content_length(initial_response, &content_length);
 
                 header_body_bytes = used - (unsigned int)(body_start - initial_response);
                 if (header_body_bytes > 0) {
@@ -1240,27 +1789,37 @@ mega_http_post_file_ex(
         if (body_used != 0 && (body_used % 65536) == 0) {
             char progress[80];
 
-            _snprintf(progress, sizeof(progress), "Received %u body bytes...",
+            _snprintf(progress, sizeof(progress), "Received %I64u body bytes...",
                 body_used);
             progress[sizeof(progress) - 1] = '\0';
             mega_http_progress(progress);
         }
 
         if (headers_done && content_length >= 0
-            && body_used >= (unsigned int)content_length)
+            && body_used >= (unsigned __int64)content_length)
         {
             break;
         }
     }
 
-    mega_http_progress("Closing TLS connection...");
-    api.close(conn);
+    ok = mega_response_is_complete(ok, headers_done, content_length,
+        body_used, result);
+
+    keep_connection = ok && content_length >= 0
+        && strncmp(initial_response, "HTTP/1.1", 8) == 0
+        && !mega_response_requests_close(initial_response);
+    mega_http_progress(keep_connection
+        ? "Keeping TLS connection open..."
+        : "Closing TLS connection...");
+    mega_release_connection(&api, conn, host, port, keep_connection);
     mega_unload_tls(&api);
     CloseHandle(file);
+    mega_crypto_zero(read_buffer, MEGA_HTTP_IO_BUFFER_SIZE);
+    LocalFree((HLOCAL)read_buffer);
 
     if (result != 0) {
-        result->bytes_received = (int)total_received;
-        result->body_bytes = (int)body_used;
+        result->bytes_received = total_received;
+        result->body_bytes = body_used;
         if (!headers_done) {
             result->status_code = mega_parse_status_code(initial_response);
             mega_copy_status_line(initial_response, result->status_line,

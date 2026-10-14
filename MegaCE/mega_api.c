@@ -1,20 +1,23 @@
 #include <string.h>
 #include <stdio.h>
 #include <windows.h>
+#include <wincrypt.h>
 #include "mega_api.h"
 #include "mega_crypto.h"
 #include "mega_hashcash.h"
 
 #define MEGA_API_HOST "g.api.mega.co.nz"
 #define MEGA_API_PORT 443
-#define MEGA_MAX_NODE_NAME 96
+#define MEGA_MAX_NODE_NAME 256
 #define MEGA_UPLOAD_CHUNK_BASE 131072UL
 #define MEGA_UPLOAD_CHUNK_MAX 1048576UL
+#define MEGA_UPLOAD_IO_BUFFER_SIZE 32768UL
 #define MEGA_UPLOAD_CRC_SIZE 12
 #define MEGA_FINGERPRINT_MAXFULL 8192UL
 #define MEGA_FINGERPRINT_SPARSE_BLOCK 64UL
 #define MEGA_FINGERPRINT_SPARSE_BLOCKS 32UL
 #define MEGA_FINGERPRINT_SPARSE_DENOM 127UL
+#define MEGA_NODE_PARSE_BUFFER_SIZE 32768U
 
 static int g_mega_request_id = 1;
 static int g_mega_login_key_valid;
@@ -52,6 +55,8 @@ typedef struct mega_node_entry {
     char name[MEGA_MAX_NODE_NAME];
     int file_key_valid;
     unsigned char file_key[32];
+    int first_child;
+    int next_sibling;
 } mega_node_entry;
 
 typedef struct mega_saved_session_file {
@@ -64,14 +69,167 @@ typedef struct mega_saved_session_file {
     unsigned char master_key[16];
 } mega_saved_session_file;
 
+#define MEGA_SESSION_WRAPPED_KEY_MAX 256
+
+typedef struct mega_saved_session_file_v2 {
+    char magic[8];
+    unsigned int version;
+    unsigned int wrapped_key_size;
+    unsigned int payload_size;
+    unsigned char iv[16];
+    unsigned char wrapped_key[MEGA_SESSION_WRAPPED_KEY_MAX];
+    unsigned char payload[(sizeof(mega_saved_session_file) + 15) & ~15];
+    unsigned char mac[16];
+} mega_saved_session_file_v2;
+
 static mega_session_state g_mega_session;
+static mega_crypto_aes128_context g_mega_master_key_context;
+static int g_mega_master_key_context_valid;
 static mega_node_entry *g_mega_nodes;
 static int g_mega_node_count;
 static int g_mega_node_capacity;
+static int *g_mega_node_handle_slots;
+static int g_mega_node_handle_capacity;
+
+static unsigned int
+mega_node_handle_hash(const char *handle)
+{
+    unsigned int hash;
+
+    hash = 2166136261UL;
+    while (handle != 0 && *handle != '\0') {
+        hash ^= (unsigned char)*handle++;
+        hash *= 16777619UL;
+    }
+    return hash;
+}
+
+static int
+mega_node_index_find(const char *handle)
+{
+    unsigned int slot;
+    unsigned int mask;
+    int index;
+
+    if (handle == 0 || handle[0] == '\0'
+        || g_mega_node_handle_slots == 0
+        || g_mega_node_handle_capacity <= 0)
+    {
+        return -1;
+    }
+    mask = (unsigned int)g_mega_node_handle_capacity - 1;
+    slot = mega_node_handle_hash(handle) & mask;
+    for (;;) {
+        index = g_mega_node_handle_slots[slot];
+        if (index < 0) {
+            return -1;
+        }
+        if (index < g_mega_node_count
+            && strcmp(g_mega_nodes[index].handle, handle) == 0)
+        {
+            return index;
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+static int
+mega_node_index_insert(int index)
+{
+    unsigned int slot;
+    unsigned int mask;
+
+    if (index < 0 || index >= g_mega_node_count
+        || g_mega_node_handle_slots == 0
+        || g_mega_node_handle_capacity <= 0)
+    {
+        return 0;
+    }
+    mask = (unsigned int)g_mega_node_handle_capacity - 1;
+    slot = mega_node_handle_hash(g_mega_nodes[index].handle) & mask;
+    while (g_mega_node_handle_slots[slot] >= 0) {
+        slot = (slot + 1) & mask;
+    }
+    g_mega_node_handle_slots[slot] = index;
+    return 1;
+}
+
+static int
+mega_nodes_rebuild_indexes(void)
+{
+    int *slots;
+    int capacity;
+    int i;
+
+    if (g_mega_node_handle_slots != 0) {
+        LocalFree((HLOCAL)g_mega_node_handle_slots);
+        g_mega_node_handle_slots = 0;
+        g_mega_node_handle_capacity = 0;
+    }
+    for (i = 0; i < g_mega_node_count; ++i) {
+        g_mega_nodes[i].first_child = -1;
+        g_mega_nodes[i].next_sibling = -1;
+    }
+    if (g_mega_node_count <= 0) {
+        return 1;
+    }
+
+    capacity = 256;
+    while (capacity < g_mega_node_count * 2) {
+        if (capacity > 0x3fffffff) {
+            return 0;
+        }
+        capacity *= 2;
+    }
+    slots = (int *)LocalAlloc(LPTR, sizeof(int) * (unsigned int)capacity);
+    if (slots == 0) {
+        return 0;
+    }
+    for (i = 0; i < capacity; ++i) {
+        slots[i] = -1;
+    }
+    g_mega_node_handle_slots = slots;
+    g_mega_node_handle_capacity = capacity;
+    for (i = 0; i < g_mega_node_count; ++i) {
+        mega_node_index_insert(i);
+    }
+    for (i = g_mega_node_count - 1; i >= 0; --i) {
+        int parent_index;
+
+        parent_index = mega_node_index_find(g_mega_nodes[i].parent);
+        if (parent_index >= 0) {
+            g_mega_nodes[i].next_sibling =
+                g_mega_nodes[parent_index].first_child;
+            g_mega_nodes[parent_index].first_child = i;
+        }
+    }
+    return 1;
+}
+
+static int
+mega_master_key_context_ready(void)
+{
+    if (g_mega_master_key_context_valid) {
+        return 1;
+    }
+    if (!g_mega_session.master_key_valid
+        || !mega_crypto_aes128_init(&g_mega_master_key_context,
+            g_mega_session.master_key))
+    {
+        return 0;
+    }
+    g_mega_master_key_context_valid = 1;
+    return 1;
+}
 
 static void
 mega_nodes_reset(void)
 {
+    if (g_mega_node_handle_slots != 0) {
+        LocalFree((HLOCAL)g_mega_node_handle_slots);
+        g_mega_node_handle_slots = 0;
+        g_mega_node_handle_capacity = 0;
+    }
     if (g_mega_nodes != 0 && g_mega_node_capacity > 0) {
         mega_crypto_zero(g_mega_nodes,
             sizeof(mega_node_entry) * (unsigned int)g_mega_node_capacity);
@@ -82,6 +240,11 @@ mega_nodes_reset(void)
 static void
 mega_nodes_free(void)
 {
+    if (g_mega_node_handle_slots != 0) {
+        LocalFree((HLOCAL)g_mega_node_handle_slots);
+    }
+    g_mega_node_handle_slots = 0;
+    g_mega_node_handle_capacity = 0;
     if (g_mega_nodes != 0) {
         mega_crypto_zero(g_mega_nodes,
             sizeof(mega_node_entry) * (unsigned int)g_mega_node_capacity);
@@ -156,6 +319,9 @@ void
 mega_api_clear_session(void)
 {
     mega_crypto_zero(&g_mega_session, sizeof(g_mega_session));
+    mega_crypto_zero(&g_mega_master_key_context,
+        sizeof(g_mega_master_key_context));
+    g_mega_master_key_context_valid = 0;
     mega_nodes_free();
 }
 
@@ -203,10 +369,169 @@ mega_api_get_session_status(char *status, unsigned int status_size)
     return 1;
 }
 
+static void
+mega_session_set_counter(unsigned char *counter, unsigned __int64 value)
+{
+    int i;
+
+    for (i = 15; i >= 8; --i) {
+        counter[i] = (unsigned char)(value & 0xff);
+        value >>= 8;
+    }
+}
+
+static int
+mega_session_crypt_payload(
+    const unsigned char *key,
+    const unsigned char *iv,
+    unsigned char *data,
+    unsigned int data_size
+)
+{
+    mega_crypto_aes128_context context;
+    unsigned int offset;
+
+    if (!mega_crypto_aes128_init(&context, key)) {
+        return 0;
+    }
+    for (offset = 0; offset < data_size; offset += 16) {
+        unsigned char stream[16];
+        unsigned int available;
+        unsigned int i;
+
+        memcpy(stream, iv, sizeof(stream));
+        mega_session_set_counter(stream, offset / 16);
+        if (!mega_crypto_aes128_encrypt_context(&context, stream)) {
+            mega_crypto_zero(&context, sizeof(context));
+            mega_crypto_zero(stream, sizeof(stream));
+            return 0;
+        }
+        available = data_size - offset;
+        if (available > 16) {
+            available = 16;
+        }
+        for (i = 0; i < available; ++i) {
+            data[offset + i] ^= stream[i];
+        }
+        mega_crypto_zero(stream, sizeof(stream));
+    }
+    mega_crypto_zero(&context, sizeof(context));
+    return 1;
+}
+
+static int
+mega_session_compute_mac(
+    const unsigned char *key,
+    const unsigned char *iv,
+    const unsigned char *payload,
+    unsigned int payload_size,
+    unsigned char *mac
+)
+{
+    mega_crypto_aes128_context context;
+    unsigned char block[16];
+    unsigned int offset;
+    unsigned int i;
+
+    if (payload_size % 16 != 0
+        || !mega_crypto_aes128_init(&context, key))
+    {
+        return 0;
+    }
+    memset(mac, 0, 16);
+    memcpy(block, iv, sizeof(block));
+    for (i = 0; i < 16; ++i) {
+        mac[i] ^= block[i];
+    }
+    if (!mega_crypto_aes128_encrypt_context(&context, mac)) {
+        mega_crypto_zero(&context, sizeof(context));
+        mega_crypto_zero(block, sizeof(block));
+        return 0;
+    }
+    for (offset = 0; offset < payload_size; offset += 16) {
+        memcpy(block, payload + offset, sizeof(block));
+        for (i = 0; i < 16; ++i) {
+            mac[i] ^= block[i];
+        }
+        if (!mega_crypto_aes128_encrypt_context(&context, mac)) {
+            mega_crypto_zero(&context, sizeof(context));
+            mega_crypto_zero(block, sizeof(block));
+            return 0;
+        }
+    }
+    mega_crypto_zero(&context, sizeof(context));
+    mega_crypto_zero(block, sizeof(block));
+    return 1;
+}
+
+static int
+mega_session_get_rsa_key(int create, HCRYPTPROV *provider, HCRYPTKEY *key)
+{
+    const WCHAR container_name[] = L"MegaCE Session Protection";
+
+    *provider = 0;
+    *key = 0;
+    if (!CryptAcquireContext(provider, container_name, 0, PROV_RSA_FULL, 0)) {
+        if (!create || GetLastError() != NTE_BAD_KEYSET
+            || !CryptAcquireContext(provider, container_name, 0,
+                PROV_RSA_FULL, CRYPT_NEWKEYSET))
+        {
+            return 0;
+        }
+    }
+    if (!CryptGetUserKey(*provider, AT_KEYEXCHANGE, key)) {
+        if (!create || !CryptGenKey(*provider, AT_KEYEXCHANGE, 0, key)) {
+            CryptReleaseContext(*provider, 0);
+            *provider = 0;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int
+mega_session_replace_file(const WCHAR *temporary, const WCHAR *path)
+{
+    WCHAR backup[MAX_PATH];
+    int had_original;
+
+    if (wcslen(path) + 12 >= MAX_PATH) {
+        return 0;
+    }
+    _snwprintf(backup, sizeof(backup) / sizeof(backup[0]),
+        L"%s.megabackup", path);
+    backup[(sizeof(backup) / sizeof(backup[0])) - 1] = L'\0';
+    had_original = GetFileAttributes(path) != INVALID_FILE_ATTRIBUTES;
+    if (had_original && GetFileAttributes(backup) != INVALID_FILE_ATTRIBUTES
+        && !DeleteFile(backup))
+    {
+        return 0;
+    }
+    if (had_original && !MoveFile(path, backup)) {
+        return 0;
+    }
+    if (!MoveFile(temporary, path)) {
+        if (had_original) {
+            MoveFile(backup, path);
+        }
+        return 0;
+    }
+    if (had_original) {
+        DeleteFile(backup);
+    }
+    return 1;
+}
+
 int
 mega_api_save_session_file(const WCHAR *path)
 {
     mega_saved_session_file file_data;
+    mega_saved_session_file_v2 protected_data;
+    HCRYPTPROV provider;
+    HCRYPTKEY rsa_key;
+    unsigned char session_keys[32];
+    DWORD wrapped_size;
+    WCHAR temporary[MAX_PATH];
     HANDLE file;
     DWORD written;
     int ok;
@@ -229,18 +554,72 @@ mega_api_save_session_file(const WCHAR *path)
     memcpy(file_data.master_key, g_mega_session.master_key,
         sizeof(file_data.master_key));
 
-    file = CreateFile(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
+    memset(&protected_data, 0, sizeof(protected_data));
+    memcpy(protected_data.magic, "MCESES2", 7);
+    protected_data.version = 2;
+    protected_data.payload_size = sizeof(file_data);
+    if (!mega_crypto_random_bytes(session_keys, sizeof(session_keys))
+        || !mega_crypto_random_bytes(protected_data.iv,
+            sizeof(protected_data.iv))
+        || !mega_session_get_rsa_key(1, &provider, &rsa_key))
+    {
+        mega_crypto_zero(&file_data, sizeof(file_data));
+        mega_crypto_zero(&protected_data, sizeof(protected_data));
+        mega_crypto_zero(session_keys, sizeof(session_keys));
+        return 0;
+    }
+    memcpy(protected_data.wrapped_key, session_keys, sizeof(session_keys));
+    wrapped_size = sizeof(session_keys);
+    ok = CryptEncrypt(rsa_key, 0, TRUE, 0, protected_data.wrapped_key,
+        &wrapped_size, sizeof(protected_data.wrapped_key)) ? 1 : 0;
+    CryptDestroyKey(rsa_key);
+    CryptReleaseContext(provider, 0);
+    protected_data.wrapped_key_size = wrapped_size;
+    memcpy(protected_data.payload, &file_data, sizeof(file_data));
+    if (!ok || !mega_session_crypt_payload(session_keys, protected_data.iv,
+        protected_data.payload, sizeof(protected_data.payload))
+        || !mega_session_compute_mac(session_keys + 16, protected_data.iv,
+            protected_data.payload, sizeof(protected_data.payload),
+            protected_data.mac))
+    {
+        mega_crypto_zero(&file_data, sizeof(file_data));
+        mega_crypto_zero(&protected_data, sizeof(protected_data));
+        mega_crypto_zero(session_keys, sizeof(session_keys));
+        return 0;
+    }
+
+    if (wcslen(path) + 5 >= MAX_PATH) {
+        mega_crypto_zero(&file_data, sizeof(file_data));
+        mega_crypto_zero(&protected_data, sizeof(protected_data));
+        mega_crypto_zero(session_keys, sizeof(session_keys));
+        return 0;
+    }
+    _snwprintf(temporary, sizeof(temporary) / sizeof(temporary[0]),
+        L"%s.tmp", path);
+    temporary[(sizeof(temporary) / sizeof(temporary[0])) - 1] = L'\0';
+    DeleteFile(temporary);
+    file = CreateFile(temporary, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, 0);
     if (file == INVALID_HANDLE_VALUE) {
         mega_crypto_zero(&file_data, sizeof(file_data));
+        mega_crypto_zero(&protected_data, sizeof(protected_data));
+        mega_crypto_zero(session_keys, sizeof(session_keys));
         return 0;
     }
 
     written = 0;
-    ok = WriteFile(file, &file_data, sizeof(file_data), &written, 0)
-        && written == sizeof(file_data);
+    ok = WriteFile(file, &protected_data, sizeof(protected_data), &written, 0)
+        && written == sizeof(protected_data) && FlushFileBuffers(file);
     CloseHandle(file);
+    if (ok) {
+        ok = mega_session_replace_file(temporary, path);
+    }
+    if (!ok) {
+        DeleteFile(temporary);
+    }
     mega_crypto_zero(&file_data, sizeof(file_data));
+    mega_crypto_zero(&protected_data, sizeof(protected_data));
+    mega_crypto_zero(session_keys, sizeof(session_keys));
     return ok ? 1 : 0;
 }
 
@@ -248,11 +627,35 @@ int
 mega_api_load_session_file(const WCHAR *path)
 {
     mega_saved_session_file file_data;
+    mega_saved_session_file_v2 protected_data;
+    HCRYPTPROV provider;
+    HCRYPTKEY rsa_key;
+    unsigned char session_keys[32];
+    unsigned char expected_mac[16];
     HANDLE file;
     DWORD read_bytes;
+    DWORD file_size_high;
+    DWORD file_size_low;
+    DWORD wrapped_size;
+    unsigned char diff;
+    unsigned int i;
+    int legacy;
+    int ok;
+    WCHAR backup[MAX_PATH];
 
     if (path == 0) {
         return 0;
+    }
+
+    if (wcslen(path) + 12 < MAX_PATH) {
+        _snwprintf(backup, sizeof(backup) / sizeof(backup[0]),
+            L"%s.megabackup", path);
+        backup[(sizeof(backup) / sizeof(backup[0])) - 1] = L'\0';
+        if (GetFileAttributes(path) == INVALID_FILE_ATTRIBUTES
+            && GetFileAttributes(backup) != INVALID_FILE_ATTRIBUTES)
+        {
+            MoveFile(backup, path);
+        }
     }
 
     file = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING,
@@ -261,22 +664,92 @@ mega_api_load_session_file(const WCHAR *path)
         return 0;
     }
 
-    read_bytes = 0;
-    memset(&file_data, 0, sizeof(file_data));
-    if (!ReadFile(file, &file_data, sizeof(file_data), &read_bytes, 0)
-        || read_bytes != sizeof(file_data))
+    file_size_high = 0;
+    file_size_low = GetFileSize(file, &file_size_high);
+    if (file_size_high != 0
+        || (file_size_low != sizeof(file_data)
+            && file_size_low != sizeof(protected_data)))
     {
         CloseHandle(file);
+        return 0;
+    }
+
+    legacy = file_size_low == sizeof(file_data);
+    read_bytes = 0;
+    memset(&file_data, 0, sizeof(file_data));
+    memset(&protected_data, 0, sizeof(protected_data));
+    memset(session_keys, 0, sizeof(session_keys));
+    memset(expected_mac, 0, sizeof(expected_mac));
+    if (legacy) {
+        ok = ReadFile(file, &file_data, sizeof(file_data), &read_bytes, 0)
+            && read_bytes == sizeof(file_data);
+    } else {
+        ok = ReadFile(file, &protected_data, sizeof(protected_data),
+            &read_bytes, 0) && read_bytes == sizeof(protected_data);
+    }
+    if (!ok) {
+        CloseHandle(file);
         mega_crypto_zero(&file_data, sizeof(file_data));
+        mega_crypto_zero(&protected_data, sizeof(protected_data));
         return 0;
     }
     CloseHandle(file);
+
+    if (!legacy) {
+        if (memcmp(protected_data.magic, "MCESES2", 7) != 0
+            || protected_data.version != 2
+            || protected_data.payload_size != sizeof(file_data)
+            || protected_data.wrapped_key_size == 0
+            || protected_data.wrapped_key_size
+                > sizeof(protected_data.wrapped_key)
+            || !mega_session_get_rsa_key(0, &provider, &rsa_key))
+        {
+            mega_crypto_zero(&protected_data, sizeof(protected_data));
+            return 0;
+        }
+        wrapped_size = protected_data.wrapped_key_size;
+        ok = CryptDecrypt(rsa_key, 0, TRUE, 0,
+            protected_data.wrapped_key, &wrapped_size) ? 1 : 0;
+        CryptDestroyKey(rsa_key);
+        CryptReleaseContext(provider, 0);
+        if (!ok || wrapped_size != sizeof(session_keys)) {
+            mega_crypto_zero(&protected_data, sizeof(protected_data));
+            return 0;
+        }
+        memcpy(session_keys, protected_data.wrapped_key,
+            sizeof(session_keys));
+        if (!mega_session_compute_mac(session_keys + 16,
+            protected_data.iv, protected_data.payload,
+            sizeof(protected_data.payload), expected_mac))
+        {
+            mega_crypto_zero(&protected_data, sizeof(protected_data));
+            mega_crypto_zero(session_keys, sizeof(session_keys));
+            return 0;
+        }
+        diff = 0;
+        for (i = 0; i < sizeof(expected_mac); ++i) {
+            diff |= (unsigned char)(expected_mac[i] ^ protected_data.mac[i]);
+        }
+        if (diff != 0 || !mega_session_crypt_payload(session_keys,
+            protected_data.iv, protected_data.payload,
+            sizeof(protected_data.payload)))
+        {
+            mega_crypto_zero(&protected_data, sizeof(protected_data));
+            mega_crypto_zero(session_keys, sizeof(session_keys));
+            mega_crypto_zero(expected_mac, sizeof(expected_mac));
+            return 0;
+        }
+        memcpy(&file_data, protected_data.payload, sizeof(file_data));
+    }
 
     if (memcmp(file_data.magic, "MCESES1", 7) != 0
         || file_data.version != 1
         || file_data.sid[0] == '\0')
     {
         mega_crypto_zero(&file_data, sizeof(file_data));
+        mega_crypto_zero(&protected_data, sizeof(protected_data));
+        mega_crypto_zero(session_keys, sizeof(session_keys));
+        mega_crypto_zero(expected_mac, sizeof(expected_mac));
         return 0;
     }
 
@@ -292,6 +765,14 @@ mega_api_load_session_file(const WCHAR *path)
         sizeof(g_mega_session.master_key));
 
     mega_crypto_zero(&file_data, sizeof(file_data));
+    mega_crypto_zero(&protected_data, sizeof(protected_data));
+    mega_crypto_zero(session_keys, sizeof(session_keys));
+    mega_crypto_zero(expected_mac, sizeof(expected_mac));
+    if (legacy && !mega_api_save_session_file(path)) {
+        mega_api_clear_session();
+        DeleteFile(path);
+        return 0;
+    }
     return 1;
 }
 
@@ -578,7 +1059,7 @@ mega_api_decrypt_session_id(void)
     int i;
     int ok;
 
-    if (!g_mega_session.master_key_valid
+    if (!mega_master_key_context_ready()
         || g_mega_session.privk[0] == '\0'
         || g_mega_session.csid[0] == '\0')
     {
@@ -596,7 +1077,7 @@ mega_api_decrypt_session_id(void)
     }
 
     for (i = 0; i < privk_len; i += 16) {
-        if (!mega_crypto_aes128_decrypt_block(g_mega_session.master_key,
+        if (!mega_crypto_aes128_decrypt_context(&g_mega_master_key_context,
             privk_bin + i))
         {
             mega_crypto_zero(privk_bin, sizeof(privk_bin));
@@ -1402,7 +1883,7 @@ mega_decrypt_node_key_part(
 
     if (key_part == 0 || key_part[0] == '\0'
         || attr_key == 0 || attr_key_size < 16
-        || !g_mega_session.master_key_valid)
+        || !mega_master_key_context_ready())
     {
         return 0;
     }
@@ -1414,7 +1895,7 @@ mega_decrypt_node_key_part(
     }
 
     for (i = 0; i < key_len; i += 16) {
-        if (!mega_crypto_aes128_decrypt_block(g_mega_session.master_key,
+        if (!mega_crypto_aes128_decrypt_context(&g_mega_master_key_context,
             key_bin + i))
         {
             mega_crypto_zero(key_bin, sizeof(key_bin));
@@ -1452,6 +1933,7 @@ mega_decrypt_attr_name(
     unsigned char attr_bin[1024];
     unsigned char prev[16];
     unsigned char cur[16];
+    mega_crypto_aes128_context attr_context;
     char *plain;
     char *n;
     int attr_len;
@@ -1470,10 +1952,16 @@ mega_decrypt_attr_name(
         return 0;
     }
 
+    if (!mega_crypto_aes128_init(&attr_context, attr_key)) {
+        mega_crypto_zero(attr_bin, sizeof(attr_bin));
+        return 0;
+    }
+
     memset(prev, 0, sizeof(prev));
     for (i = 0; i < attr_len; i += 16) {
         memcpy(cur, attr_bin + i, 16);
-        if (!mega_crypto_aes128_decrypt_block(attr_key, attr_bin + i)) {
+        if (!mega_crypto_aes128_decrypt_context(&attr_context, attr_bin + i)) {
+            mega_crypto_zero(&attr_context, sizeof(attr_context));
             mega_crypto_zero(attr_bin, sizeof(attr_bin));
             return 0;
         }
@@ -1486,17 +1974,20 @@ mega_decrypt_attr_name(
 
     plain = (char *)attr_bin;
     if (strncmp(plain, "MEGA", 4) != 0) {
+        mega_crypto_zero(&attr_context, sizeof(attr_context));
         mega_crypto_zero(attr_bin, sizeof(attr_bin));
         return 0;
     }
 
     n = strstr(plain, "\"n\"");
     if (n == 0) {
+        mega_crypto_zero(&attr_context, sizeof(attr_context));
         mega_crypto_zero(attr_bin, sizeof(attr_bin));
         return 0;
     }
     n = strchr(n, ':');
     if (n == 0) {
+        mega_crypto_zero(&attr_context, sizeof(attr_context));
         mega_crypto_zero(attr_bin, sizeof(attr_bin));
         return 0;
     }
@@ -1505,14 +1996,17 @@ mega_decrypt_attr_name(
         n++;
     }
     if (*n != '"') {
+        mega_crypto_zero(&attr_context, sizeof(attr_context));
         mega_crypto_zero(attr_bin, sizeof(attr_bin));
         return 0;
     }
     if (!mega_json_copy_string_value(n, name, name_size)) {
+        mega_crypto_zero(&attr_context, sizeof(attr_context));
         mega_crypto_zero(attr_bin, sizeof(attr_bin));
         return 0;
     }
 
+    mega_crypto_zero(&attr_context, sizeof(attr_context));
     mega_crypto_zero(attr_bin, sizeof(attr_bin));
     return 1;
 }
@@ -1728,11 +2222,11 @@ mega_object_append_char(char **object, unsigned int *used, unsigned int *capacit
     return 1;
 }
 
-static void
+static int
 mega_parse_fetch_nodes_file_body(const WCHAR *response_file_path, mega_fetch_nodes_summary *summary)
 {
     HANDLE file;
-    char buffer[2048];
+    char *buffer;
     DWORD read_bytes;
     int found_f_key;
     int in_f_array;
@@ -1744,18 +2238,26 @@ mega_parse_fetch_nodes_file_body(const WCHAR *response_file_path, mega_fetch_nod
     char *object;
     unsigned int object_used;
     unsigned int object_capacity;
+    int complete;
+    int read_ok;
 
     mega_nodes_reset();
 
     if (response_file_path == 0 || summary == 0) {
-        return;
+        return 0;
     }
 
     file = CreateFile(response_file_path, GENERIC_READ, FILE_SHARE_READ,
         0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (file == INVALID_HANDLE_VALUE) {
         summary->truncated = 1;
-        return;
+        return 0;
+    }
+    buffer = (char *)LocalAlloc(LPTR, MEGA_NODE_PARSE_BUFFER_SIZE);
+    if (buffer == 0) {
+        CloseHandle(file);
+        summary->truncated = 1;
+        return 0;
     }
 
     found_f_key = 0;
@@ -1770,11 +2272,18 @@ mega_parse_fetch_nodes_file_body(const WCHAR *response_file_path, mega_fetch_nod
     object = 0;
     object_used = 0;
     object_capacity = 0;
+    complete = 0;
+    read_ok = 1;
 
-    while (ReadFile(file, buffer, sizeof(buffer), &read_bytes, 0)
-        && read_bytes > 0)
-    {
+    while ((read_ok = ReadFile(file, buffer, MEGA_NODE_PARSE_BUFFER_SIZE,
+            &read_bytes, 0))
+        && read_bytes > 0) {
         DWORD i;
+
+        if (mega_http_cancel_requested()) {
+            summary->truncated = 1;
+            goto done;
+        }
 
         for (i = 0; i < read_bytes; ++i) {
             char c;
@@ -1834,6 +2343,7 @@ mega_parse_fetch_nodes_file_body(const WCHAR *response_file_path, mega_fetch_nod
             }
 
             if (c == ']') {
+                complete = 1;
                 goto done;
             }
             if (c == '{') {
@@ -1852,15 +2362,31 @@ mega_parse_fetch_nodes_file_body(const WCHAR *response_file_path, mega_fetch_nod
     }
 
 done:
+    if (!read_ok || !complete || !found_f_key || !in_f_array
+        || object_depth != 0 || in_string || escape)
+    {
+        summary->truncated = 1;
+    }
     if (object != 0) {
+        mega_crypto_zero(object, object_capacity);
         LocalFree((HLOCAL)object);
     }
+    mega_crypto_zero(buffer, MEGA_NODE_PARSE_BUFFER_SIZE);
+    LocalFree((HLOCAL)buffer);
     CloseHandle(file);
+    mega_nodes_rebuild_indexes();
     summary->parsed_nodes = g_mega_node_count;
     summary->node_count = g_mega_node_count;
+    if (summary->truncated) {
+        mega_nodes_reset();
+        summary->parsed_nodes = 0;
+        summary->node_count = 0;
+        return 0;
+    }
+    return 1;
 }
 
-static void
+static int
 mega_parse_fetch_nodes(const char *response_body, mega_fetch_nodes_summary *summary)
 {
     const char *array;
@@ -1870,16 +2396,18 @@ mega_parse_fetch_nodes(const char *response_body, mega_fetch_nodes_summary *summ
     mega_nodes_reset();
 
     if (response_body == 0 || summary == 0) {
-        return;
+        return 0;
     }
 
     array = strstr(response_body, "\"f\"");
     if (array == 0) {
-        return;
+        summary->truncated = 1;
+        return 0;
     }
     array = strchr(array, '[');
     if (array == 0) {
-        return;
+        summary->truncated = 1;
+        return 0;
     }
     if (!mega_find_array_end(array, &array_end)) {
         array_end = response_body + strlen(response_body);
@@ -1896,10 +2424,12 @@ mega_parse_fetch_nodes(const char *response_body, mega_fetch_nodes_summary *summ
         unsigned int object_len;
 
         if (!mega_find_object_end(p, &end)) {
+            summary->truncated = 1;
             break;
         }
         object_len = (unsigned int)(end - p);
         if (object_len >= sizeof(object)) {
+            summary->truncated = 1;
             p = end;
             continue;
         }
@@ -1909,7 +2439,15 @@ mega_parse_fetch_nodes(const char *response_body, mega_fetch_nodes_summary *summ
         p = end;
     }
 
+    mega_nodes_rebuild_indexes();
     summary->parsed_nodes = g_mega_node_count;
+    if (summary->truncated) {
+        mega_nodes_reset();
+        summary->parsed_nodes = 0;
+        summary->node_count = 0;
+        return 0;
+    }
+    return 1;
 }
 
 int
@@ -1936,11 +2474,15 @@ mega_api_fetch_nodes(
         summary->rubbish_count = mega_count_token(response_body, "\"t\":4");
         summary->users_count = mega_count_token(response_body, "\"u\"");
         if (result != 0
-            && result->http.body_bytes >= (int)response_body_size - 1)
+            && result->http.body_bytes
+                >= (unsigned __int64)(response_body_size - 1))
         {
             summary->truncated = 1;
         }
-        mega_parse_fetch_nodes(response_body, summary);
+        if (!mega_parse_fetch_nodes(response_body, summary)) {
+            mega_api_set_error(result, "incomplete MEGA node response");
+            ok = 0;
+        }
     }
 
     return ok;
@@ -1963,7 +2505,10 @@ mega_api_fetch_nodes_file(
         response_file_path, result);
 
     if (ok && summary != 0) {
-        mega_parse_fetch_nodes_file_body(response_file_path, summary);
+        if (!mega_parse_fetch_nodes_file_body(response_file_path, summary)) {
+            mega_api_set_error(result, "incomplete MEGA node response");
+            ok = 0;
+        }
     }
 
     return ok;
@@ -2012,11 +2557,19 @@ int
 mega_api_find_node_by_handle(const char *handle)
 {
     int i;
+    int indexed;
 
     if (handle == 0 || handle[0] == '\0') {
         return -1;
     }
 
+    indexed = mega_node_index_find(handle);
+    if (indexed >= 0) {
+        return indexed;
+    }
+    if (g_mega_node_handle_slots != 0) {
+        return -1;
+    }
     for (i = 0; i < g_mega_node_count; ++i) {
         if (strcmp(g_mega_nodes[i].handle, handle) == 0) {
             return i;
@@ -2030,9 +2583,19 @@ mega_api_get_child_node(const char *parent, int child_offset, mega_node_info *no
 {
     int i;
     int seen;
+    int parent_index;
 
     if (parent == 0 || parent[0] == '\0' || child_offset < 0) {
         return 0;
+    }
+
+    parent_index = mega_api_find_node_by_handle(parent);
+    if (parent_index >= 0 && g_mega_node_handle_slots != 0) {
+        i = g_mega_nodes[parent_index].first_child;
+        while (i >= 0 && child_offset-- > 0) {
+            i = g_mega_nodes[i].next_sibling;
+        }
+        return i >= 0 ? mega_api_get_node(i, node) : 0;
     }
 
     seen = 0;
@@ -2045,6 +2608,45 @@ mega_api_get_child_node(const char *parent, int child_offset, mega_node_info *no
         }
     }
     return 0;
+}
+
+int
+mega_api_get_first_child_index(const char *parent)
+{
+    int parent_index;
+    int i;
+
+    parent_index = mega_api_find_node_by_handle(parent);
+    if (parent_index >= 0 && g_mega_node_handle_slots != 0) {
+        return g_mega_nodes[parent_index].first_child;
+    }
+    for (i = 0; i < g_mega_node_count; ++i) {
+        if (strcmp(g_mega_nodes[i].parent, parent) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int
+mega_api_get_next_sibling_index(int node_index)
+{
+    int i;
+
+    if (node_index < 0 || node_index >= g_mega_node_count) {
+        return -1;
+    }
+    if (g_mega_node_handle_slots != 0) {
+        return g_mega_nodes[node_index].next_sibling;
+    }
+    for (i = node_index + 1; i < g_mega_node_count; ++i) {
+        if (strcmp(g_mega_nodes[i].parent,
+            g_mega_nodes[node_index].parent) == 0)
+        {
+            return i;
+        }
+    }
+    return -1;
 }
 
 static unsigned int
@@ -2074,6 +2676,8 @@ mega_api_add_local_folder_node(
 )
 {
     mega_node_entry *node;
+    int node_index;
+    int parent_index;
 
     if (handle == 0 || handle[0] == '\0'
         || parent == 0 || parent[0] == '\0'
@@ -2088,7 +2692,8 @@ mega_api_add_local_folder_node(
         return 0;
     }
 
-    node = &g_mega_nodes[g_mega_node_count];
+    node_index = g_mega_node_count;
+    node = &g_mega_nodes[node_index];
     memset(node, 0, sizeof(*node));
     _snprintf(node->handle, sizeof(node->handle), "%s", handle);
     node->handle[sizeof(node->handle) - 1] = '\0';
@@ -2098,7 +2703,30 @@ mega_api_add_local_folder_node(
     node->name[sizeof(node->name) - 1] = '\0';
     node->type = 1;
     node->mtime = mega_api_current_unix_time();
+    node->first_child = -1;
+    node->next_sibling = -1;
     g_mega_node_count++;
+    if (g_mega_node_handle_slots == 0
+        || g_mega_node_count * 2 > g_mega_node_handle_capacity)
+    {
+        mega_nodes_rebuild_indexes();
+    } else {
+        mega_node_index_insert(node_index);
+        parent_index = mega_node_index_find(parent);
+        if (parent_index >= 0) {
+            int child_index;
+
+            child_index = g_mega_nodes[parent_index].first_child;
+            if (child_index < 0) {
+                g_mega_nodes[parent_index].first_child = node_index;
+            } else {
+                while (g_mega_nodes[child_index].next_sibling >= 0) {
+                    child_index = g_mega_nodes[child_index].next_sibling;
+                }
+                g_mega_nodes[child_index].next_sibling = node_index;
+            }
+        }
+    }
     return 1;
 }
 
@@ -2186,6 +2814,7 @@ mega_api_remove_local_node(const char *handle)
     }
     g_mega_node_count = write_index;
     LocalFree((HLOCAL)remove_flags);
+    mega_nodes_rebuild_indexes();
     return removed > 0;
 }
 
@@ -2330,6 +2959,7 @@ mega_encrypt_attr_json(
 {
     unsigned char attr[512];
     unsigned char prev[16];
+    mega_crypto_aes128_context attr_context;
     unsigned int plain_len;
     unsigned int padded_len;
     unsigned int i;
@@ -2350,13 +2980,20 @@ mega_encrypt_attr_json(
     }
     memset(attr + plain_len, 0, padded_len - plain_len);
     memset(prev, 0, sizeof(prev));
+    if (!mega_crypto_aes128_init(&attr_context, key)) {
+        mega_crypto_zero(attr, sizeof(attr));
+        mega_crypto_zero(prev, sizeof(prev));
+        return 0;
+    }
 
     for (i = 0; i < padded_len; i += 16) {
         for (b = 0; b < 16; ++b) {
             attr[i + b] ^= prev[b];
         }
-        if (!mega_crypto_aes128_encrypt_block(key, attr + i)) {
+        if (!mega_crypto_aes128_encrypt_context(&attr_context, attr + i)) {
+            mega_crypto_zero(&attr_context, sizeof(attr_context));
             mega_crypto_zero(attr, sizeof(attr));
+            mega_crypto_zero(prev, sizeof(prev));
             return 0;
         }
         memcpy(prev, attr + i, 16);
@@ -2364,6 +3001,7 @@ mega_encrypt_attr_json(
 
     i = mega_crypto_base64url_encode(attr, (int)padded_len,
         attr_b64, attr_b64_size);
+    mega_crypto_zero(&attr_context, sizeof(attr_context));
     mega_crypto_zero(attr, sizeof(attr));
     mega_crypto_zero(prev, sizeof(prev));
     return i;
@@ -2434,13 +3072,13 @@ mega_encrypt_node_key(
 
     if (raw_key == 0 || key_b64 == 0
         || (raw_key_len != 16 && raw_key_len != 32)
-        || !g_mega_session.master_key_valid)
+        || !mega_master_key_context_ready())
     {
         return 0;
     }
     memcpy(encrypted_key, raw_key, (unsigned int)raw_key_len);
     for (i = 0; i < raw_key_len; i += 16) {
-        if (!mega_crypto_aes128_encrypt_block(g_mega_session.master_key,
+        if (!mega_crypto_aes128_encrypt_context(&g_mega_master_key_context,
             encrypted_key + i))
         {
             mega_crypto_zero(encrypted_key, sizeof(encrypted_key));
@@ -2540,62 +3178,96 @@ mega_upload_crc_update(
 }
 
 static int
+mega_aes_ctr_xor(
+    const mega_crypto_aes128_context *context,
+    const unsigned char *iv,
+    unsigned char *data,
+    unsigned int data_size,
+    unsigned __int64 data_start
+)
+{
+    unsigned int offset;
+
+    offset = 0;
+    while (offset < data_size) {
+        unsigned char streams[128];
+        unsigned __int64 absolute_offset;
+        unsigned int stream_offset;
+        unsigned int block_count;
+        unsigned int available;
+        unsigned int block;
+        unsigned int i;
+
+        absolute_offset = data_start + offset;
+        stream_offset = (unsigned int)(absolute_offset & 15U);
+        if (stream_offset == 0 && data_size - offset >= 16) {
+            block_count = (data_size - offset) / 16;
+            if (block_count > 8) {
+                block_count = 8;
+            }
+        } else {
+            block_count = 1;
+        }
+        for (block = 0; block < block_count; ++block) {
+            memcpy(streams + block * 16, iv, 8);
+            mega_set_counter_be64(streams + block * 16 + 8,
+                absolute_offset / 16 + block);
+        }
+        if (!mega_crypto_aes128_encrypt_blocks(context, streams,
+            block_count))
+        {
+            mega_crypto_zero(streams, sizeof(streams));
+            return 0;
+        }
+        available = block_count * 16 - stream_offset;
+        if (available > data_size - offset) {
+            available = data_size - offset;
+        }
+        for (i = 0; i < available; ++i) {
+            data[offset + i] ^= streams[stream_offset + i];
+        }
+        mega_crypto_zero(streams, sizeof(streams));
+        offset += available;
+    }
+    return 1;
+}
+
+static int
 mega_encrypt_upload_chunk(
-    const unsigned char *transfer_key,
+    const mega_crypto_aes128_context *transfer_context,
     const unsigned char *iv,
     unsigned char *buffer,
-    unsigned int chunk_size,
-    unsigned __int64 chunk_start,
-    unsigned char *chunk_mac
+    unsigned int data_size,
+    unsigned __int64 data_start,
+    unsigned char *chunk_mac,
+    int final_part
 )
 {
     unsigned int padded_len;
     unsigned int offset;
     unsigned int b;
 
-    memcpy(chunk_mac, iv, 8);
-    memcpy(chunk_mac + 8, iv, 8);
-    padded_len = (chunk_size + 15U) & ~15U;
-    if (padded_len > chunk_size) {
-        memset(buffer + chunk_size, 0, padded_len - chunk_size);
+    padded_len = final_part ? (data_size + 15U) & ~15U : data_size;
+    if (padded_len > data_size) {
+        memset(buffer + data_size, 0, padded_len - data_size);
     }
 
     for (offset = 0; offset < padded_len; offset += 16) {
         for (b = 0; b < 16; ++b) {
             chunk_mac[b] ^= buffer[offset + b];
         }
-        if (!mega_crypto_aes128_encrypt_block(transfer_key, chunk_mac)) {
+        if (!mega_crypto_aes128_encrypt_context(transfer_context, chunk_mac)) {
             return 0;
         }
     }
 
-    for (offset = 0; offset < chunk_size; offset += 16) {
-        unsigned char stream[16];
-        unsigned int available;
-
-        available = chunk_size - offset;
-        if (available > 16) {
-            available = 16;
-        }
-        memcpy(stream, iv, 8);
-        mega_set_counter_be64(stream + 8, (chunk_start + offset) / 16);
-        if (!mega_crypto_aes128_encrypt_block(transfer_key, stream)) {
-            mega_crypto_zero(stream, sizeof(stream));
-            return 0;
-        }
-        for (b = 0; b < available; ++b) {
-            buffer[offset + b] ^= stream[b];
-        }
-        mega_crypto_zero(stream, sizeof(stream));
-    }
-
-    return 1;
+    return mega_aes_ctr_xor(transfer_context, iv, buffer, data_size,
+        data_start);
 }
 
 static int
-mega_encrypt_upload_file(
+mega_prepare_upload_file(
     const WCHAR *plain_path,
-    const WCHAR *encrypted_path,
     unsigned char *raw_key,
     unsigned int raw_key_size,
     unsigned __int64 *plain_size,
@@ -2604,11 +3276,11 @@ mega_encrypt_upload_file(
 )
 {
     HANDLE in_file;
-    HANDLE out_file;
     unsigned char transfer_key[16];
     unsigned char iv[8];
     unsigned char fold_mac[16];
     unsigned char upload_crc[MEGA_UPLOAD_CRC_SIZE];
+    mega_crypto_aes128_context transfer_context;
     unsigned char *buffer;
     unsigned __int64 remaining;
     unsigned __int64 position;
@@ -2616,7 +3288,7 @@ mega_encrypt_upload_file(
     int ok;
     int i;
 
-    if (plain_path == 0 || encrypted_path == 0 || raw_key == 0
+    if (plain_path == 0 || raw_key == 0
         || raw_key_size < 32 || upload_crc_b64 == 0
         || upload_crc_b64_size == 0)
     {
@@ -2631,11 +3303,18 @@ mega_encrypt_upload_file(
     {
         return 0;
     }
+    if (!mega_crypto_aes128_init(&transfer_context, transfer_key)) {
+        mega_crypto_zero(transfer_key, sizeof(transfer_key));
+        mega_crypto_zero(iv, sizeof(iv));
+        return 0;
+    }
 
     memset(fold_mac, 0, sizeof(fold_mac));
     memset(upload_crc, 0, sizeof(upload_crc));
-    buffer = (unsigned char *)LocalAlloc(LPTR, MEGA_UPLOAD_CHUNK_MAX + 16);
+    buffer = (unsigned char *)LocalAlloc(LPTR,
+        MEGA_UPLOAD_IO_BUFFER_SIZE + 16);
     if (buffer == 0) {
+        mega_crypto_zero(&transfer_context, sizeof(transfer_context));
         mega_crypto_zero(transfer_key, sizeof(transfer_key));
         mega_crypto_zero(iv, sizeof(iv));
         return 0;
@@ -2645,67 +3324,71 @@ mega_encrypt_upload_file(
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (in_file == INVALID_HANDLE_VALUE) {
         LocalFree((HLOCAL)buffer);
+        mega_crypto_zero(&transfer_context, sizeof(transfer_context));
         mega_crypto_zero(transfer_key, sizeof(transfer_key));
         mega_crypto_zero(iv, sizeof(iv));
         mega_crypto_zero(fold_mac, sizeof(fold_mac));
         mega_crypto_zero(upload_crc, sizeof(upload_crc));
         return 0;
     }
-    out_file = CreateFile(encrypted_path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL, 0);
-    if (out_file == INVALID_HANDLE_VALUE) {
-        CloseHandle(in_file);
-        LocalFree((HLOCAL)buffer);
-        mega_crypto_zero(transfer_key, sizeof(transfer_key));
-        mega_crypto_zero(iv, sizeof(iv));
-        mega_crypto_zero(fold_mac, sizeof(fold_mac));
-        mega_crypto_zero(upload_crc, sizeof(upload_crc));
-        return 0;
-    }
-
     ok = 1;
     remaining = *plain_size;
     position = 0;
     next_chunk_size = MEGA_UPLOAD_CHUNK_BASE;
     while (remaining > 0) {
         unsigned int chunk_size;
+        unsigned int chunk_remaining;
         unsigned char chunk_mac[16];
-        DWORD written;
+
+        if (mega_http_cancel_requested()) {
+            ok = 0;
+            break;
+        }
 
         chunk_size = remaining < (unsigned __int64)next_chunk_size
             ? (unsigned int)remaining
             : (unsigned int)next_chunk_size;
-        if (!mega_read_file_chunk(in_file, buffer, chunk_size)
-            || !mega_encrypt_upload_chunk(transfer_key, iv, buffer,
-                chunk_size, position, chunk_mac))
-        {
+        chunk_remaining = chunk_size;
+        memcpy(chunk_mac, iv, 8);
+        memcpy(chunk_mac + 8, iv, 8);
+        while (chunk_remaining > 0) {
+            unsigned int data_size;
+
+            if (mega_http_cancel_requested()) {
+                ok = 0;
+                break;
+            }
+
+            data_size = chunk_remaining < MEGA_UPLOAD_IO_BUFFER_SIZE
+                ? chunk_remaining
+                : MEGA_UPLOAD_IO_BUFFER_SIZE;
+            if (!mega_read_file_chunk(in_file, buffer, data_size)
+                || !mega_encrypt_upload_chunk(&transfer_context, iv, buffer,
+                    data_size, position, chunk_mac,
+                    data_size == chunk_remaining))
+            {
+                ok = 0;
+                break;
+            }
+            mega_upload_crc_update(upload_crc, buffer, data_size, position);
+            position += data_size;
+            remaining -= data_size;
+            chunk_remaining -= data_size;
+        }
+        if (!ok) {
             mega_crypto_zero(chunk_mac, sizeof(chunk_mac));
-            ok = 0;
             break;
         }
 
         for (i = 0; i < 16; ++i) {
             fold_mac[i] ^= chunk_mac[i];
         }
-        if (!mega_crypto_aes128_encrypt_block(transfer_key, fold_mac)) {
+        if (!mega_crypto_aes128_encrypt_context(&transfer_context, fold_mac)) {
             mega_crypto_zero(chunk_mac, sizeof(chunk_mac));
             ok = 0;
             break;
         }
-        mega_upload_crc_update(upload_crc, buffer, chunk_size, position);
-
-        written = 0;
-        if (!WriteFile(out_file, buffer, chunk_size, &written, 0)
-            || written != chunk_size)
-        {
-            mega_crypto_zero(chunk_mac, sizeof(chunk_mac));
-            ok = 0;
-            break;
-        }
-
         mega_crypto_zero(chunk_mac, sizeof(chunk_mac));
-        position += chunk_size;
-        remaining -= chunk_size;
         if (next_chunk_size < MEGA_UPLOAD_CHUNK_MAX) {
             next_chunk_size += MEGA_UPLOAD_CHUNK_BASE;
             if (next_chunk_size > MEGA_UPLOAD_CHUNK_MAX) {
@@ -2714,7 +3397,6 @@ mega_encrypt_upload_file(
         }
     }
 
-    CloseHandle(out_file);
     CloseHandle(in_file);
 
     if (ok) {
@@ -2736,17 +3418,42 @@ mega_encrypt_upload_file(
         }
         mega_crypto_zero(meta, sizeof(meta));
     }
-    if (!ok) {
-        DeleteFile(encrypted_path);
-    }
-
+    mega_crypto_zero(&transfer_context, sizeof(transfer_context));
     mega_crypto_zero(transfer_key, sizeof(transfer_key));
     mega_crypto_zero(iv, sizeof(iv));
     mega_crypto_zero(fold_mac, sizeof(fold_mac));
     mega_crypto_zero(upload_crc, sizeof(upload_crc));
-    mega_crypto_zero(buffer, MEGA_UPLOAD_CHUNK_MAX + 16);
+    mega_crypto_zero(buffer, MEGA_UPLOAD_IO_BUFFER_SIZE + 16);
     LocalFree((HLOCAL)buffer);
     return ok;
+}
+
+typedef struct mega_upload_stream_state {
+    mega_crypto_aes128_context transfer_context;
+    unsigned char iv[8];
+    unsigned __int64 position;
+} mega_upload_stream_state;
+
+static int
+mega_encrypt_upload_stream(
+    unsigned char *data,
+    unsigned int data_len,
+    void *user_data
+)
+{
+    mega_upload_stream_state *state;
+
+    state = (mega_upload_stream_state *)user_data;
+    if (data == 0 || state == 0) {
+        return 0;
+    }
+    if (!mega_aes_ctr_xor(&state->transfer_context, state->iv, data,
+        data_len, state->position))
+    {
+            return 0;
+    }
+    state->position += data_len;
+    return 1;
 }
 
 static int
@@ -3017,7 +3724,11 @@ mega_api_upload_file_update(
     char upload_crc_b64[32];
     char escaped_token[160];
     unsigned char attr_key[16];
+    unsigned char transfer_key[16];
+    mega_upload_stream_state stream_state;
+    HANDLE source_lock;
     unsigned int upload_body_len;
+    int i;
     int ok;
 
     if (new_handle != 0 && new_handle_size > 0) {
@@ -3035,12 +3746,21 @@ mega_api_upload_file_update(
         return 0;
     }
 
+    source_lock = CreateFile(local_path, GENERIC_READ, FILE_SHARE_READ, 0,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (source_lock == INVALID_HANDLE_VALUE) {
+        mega_api_set_error(result, "upload source is unavailable or changing");
+        return 0;
+    }
+
+    DeleteFile(encrypted_path);
     memset(raw_key, 0, sizeof(raw_key));
-    if (!mega_encrypt_upload_file(local_path, encrypted_path, raw_key,
-        sizeof(raw_key), &plain_size, upload_crc_b64,
+    if (!mega_prepare_upload_file(local_path, raw_key, sizeof(raw_key),
+        &plain_size, upload_crc_b64,
         sizeof(upload_crc_b64)))
     {
-        mega_api_set_error(result, "could not encrypt upload file");
+        CloseHandle(source_lock);
+        mega_api_set_error(result, "could not prepare streaming upload");
         return 0;
     }
 
@@ -3053,6 +3773,7 @@ mega_api_upload_file_update(
         DeleteFile(encrypted_path);
         mega_crypto_zero(attr_key, sizeof(attr_key));
         mega_crypto_zero(raw_key, sizeof(raw_key));
+        CloseHandle(source_lock);
         mega_api_set_error(result, "could not encrypt upload attributes");
         return 0;
     }
@@ -3062,13 +3783,14 @@ mega_api_upload_file_update(
     {
         DeleteFile(encrypted_path);
         mega_crypto_zero(raw_key, sizeof(raw_key));
+        CloseHandle(source_lock);
         mega_api_set_error(result, "could not encode upload key");
         return 0;
     }
 
     _snprintf(command, sizeof(command),
-        "[{\"a\":\"u\",\"ssl\":2,\"v\":3,\"s\":%lu}]",
-        (unsigned long)plain_size);
+        "[{\"a\":\"u\",\"ssl\":2,\"v\":3,\"s\":%I64u}]",
+        plain_size);
     command[sizeof(command) - 1] = '\0';
     response_body[0] = '\0';
     ok = mega_api_session_command(command, response_body,
@@ -3081,6 +3803,7 @@ mega_api_upload_file_update(
         if (ok) {
             mega_api_set_error(result, "MEGA upload URL not found");
         }
+        CloseHandle(source_lock);
         return 0;
     }
 
@@ -3089,19 +3812,45 @@ mega_api_upload_file_update(
     upload_url_sized[sizeof(upload_url_sized) - 1] = '\0';
 
     response_body[0] = '\0';
-    if (!mega_http_upload_file_to_url(upload_url_sized, encrypted_path,
-        response_body, sizeof(response_body), result != 0 ? &result->http : 0))
+    memset(&stream_state, 0, sizeof(stream_state));
+    for (i = 0; i < 16; ++i) {
+        transfer_key[i] = (unsigned char)(raw_key[i] ^ raw_key[i + 16]);
+    }
+    memcpy(stream_state.iv, raw_key + 16, sizeof(stream_state.iv));
+    if (!mega_crypto_aes128_init(&stream_state.transfer_context,
+        transfer_key))
     {
-        DeleteFile(encrypted_path);
+        mega_crypto_zero(transfer_key, sizeof(transfer_key));
+        mega_crypto_zero(&stream_state, sizeof(stream_state));
         mega_crypto_zero(raw_key, sizeof(raw_key));
+        CloseHandle(source_lock);
+        mega_api_set_error(result, "could not initialize streaming upload");
+        return 0;
+    }
+    mega_crypto_zero(transfer_key, sizeof(transfer_key));
+    if (!mega_http_upload_file_to_url_ex(upload_url_sized, local_path,
+        mega_encrypt_upload_stream, &stream_state, response_body,
+        sizeof(response_body), result != 0 ? &result->http : 0))
+    {
+        mega_crypto_zero(&stream_state, sizeof(stream_state));
+        mega_crypto_zero(raw_key, sizeof(raw_key));
+        CloseHandle(source_lock);
         mega_api_set_error(result, result != 0 && result->http.error[0] != '\0'
             ? result->http.error
             : "encrypted upload failed");
         return 0;
     }
-    DeleteFile(encrypted_path);
+    mega_crypto_zero(&stream_state, sizeof(stream_state));
+    CloseHandle(source_lock);
+    source_lock = INVALID_HANDLE_VALUE;
 
-    upload_body_len = result != 0 ? (unsigned int)result->http.body_bytes : 0;
+    if (result != 0 && result->http.body_bytes >= sizeof(response_body)) {
+        mega_crypto_zero(raw_key, sizeof(raw_key));
+        mega_api_set_error(result, "MEGA upload response too large");
+        return 0;
+    }
+    upload_body_len = result != 0
+        ? (unsigned int)result->http.body_bytes : 0;
     if (!mega_extract_upload_token(response_body, upload_body_len,
         upload_token, sizeof(upload_token))
         || !mega_json_escape_string(upload_token, escaped_token,

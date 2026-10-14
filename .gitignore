@@ -23,6 +23,7 @@ settings.dat
 syncstate.dat
 fetch_nodes.tmp
 *.megaenc
+*.megapart
 *.megaupload
 
 # Local/reference checkouts
